@@ -1,0 +1,11 @@
+# macOS Finder metadata
+.DS_Store
+
+# Claude Code personal settings. The shareable .claude/settings.json is
+# deliberately NOT ignored — only the local override, which holds per-machine
+# permission grants.
+.claude/settings.local.json
+
+# Editor scratch
+*~
+*.swp
