@@ -53,18 +53,19 @@ This reads the tier out of your transcript, per session, and keeps reading it.
 Requires `jq` 1.5 or newer (`brew install jq` / `apt install jq`).
 
 ```sh
-git clone https://github.com/jamessqr/claude-cache-status
-cd claude-cache-status
-chmod +x claude-cache-status.sh
+curl -fsSL https://raw.githubusercontent.com/jamessqr/claude-cache-status/v1.0.0/claude-cache-status.sh \
+  -o ~/.claude/claude-cache-status.sh
+chmod +x ~/.claude/claude-cache-status.sh
 ```
 
-Point your status line at it in `~/.claude/settings.json`:
+Then add this to `~/.claude/settings.json`, verbatim — there is nothing to
+substitute:
 
 ```json
 {
   "statusLine": {
     "type": "command",
-    "command": "/absolute/path/to/claude-cache-status.sh",
+    "command": "~/.claude/claude-cache-status.sh",
     "refreshInterval": 30
   }
 }
@@ -74,6 +75,19 @@ Point your status line at it in `~/.claude/settings.json`:
 countdown freezes while you sit at the prompt, which is exactly when you are
 looking at it. `30` suits the 1-hour tier. Use `1`–`5` if you want a live
 seconds readout — the warm path costs about 11 ms, so a 1 Hz refresh is safe.
+
+The URL is pinned to a release tag, so the bytes you audit are the bytes you
+run. There is deliberately no `curl | sh` installer: this reads your session
+transcripts, and piping it straight into a shell is the one arrangement that
+guarantees nobody read it first. See [Security and
+privacy](#security-and-privacy) for what it does and does not touch.
+
+To read it in a checkout, or to run the tests, clone instead — the script has no
+dependencies on the rest of the repo and works from anywhere you point at it:
+
+```sh
+git clone https://github.com/jamessqr/claude-cache-status
+```
 
 Already have a status line? See [Adding this to an existing status
 line](#adding-this-to-an-existing-status-line).
