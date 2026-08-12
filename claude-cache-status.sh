@@ -102,13 +102,20 @@ _is_int() {
 # arithmetic, so it does not need to be numeric — which lets us ask for
 # FRACTIONAL mtime. Whole-second mtime is not enough: two writes inside the
 # same second that leave the file the same length are indistinguishable, and
-# the stale state then gets served. BSD (macOS) first, GNU second, whole
-# seconds only as a last resort.
+# the stale state then gets served.
+#
+# GNU is probed FIRST, and the order is load-bearing. The two implementations
+# disagree about -f: on BSD it introduces the format string, on GNU it is
+# --file-system, an unrelated flag that SUCCEEDS and prints filesystem details.
+# Probing -f first therefore short-circuits on Linux with output that is not a
+# token, no state is ever cached, and the tier is forgotten on every write-free
+# turn. -c is safe to probe first because BSD stat has no such option and exits
+# non-zero. Whole seconds are the last resort on either.
 _stat_token() {
-  stat -f '%Fm-%z' "$1" 2>/dev/null ||
-    stat -c '%.9Y-%s' "$1" 2>/dev/null ||
-    stat -f '%m-%z' "$1" 2>/dev/null ||
-    stat -c '%Y-%s' "$1" 2>/dev/null
+  stat -c '%.9Y-%s' "$1" 2>/dev/null ||
+    stat -f '%Fm-%z' "$1" 2>/dev/null ||
+    stat -c '%Y-%s' "$1" 2>/dev/null ||
+    stat -f '%m-%z' "$1" 2>/dev/null
 }
 
 # Validate a change token: digits, dots and dashes only, bounded length. It is
