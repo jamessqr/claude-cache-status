@@ -219,7 +219,10 @@ check "off by default (no env var)"        "cache 59m"        "$_o"
 
 check "1h Opus   700K -> 0.7 x \$9.50"    "cache 59m \$6.65"  "$(priced "$W/p1h.jsonl" p1 claude-opus-5     700000)"
 check_t "5m Opus 700K -> 0.7 x \$5.75"   "cache 4:30 \$4.02" "cache 4:29 \$4.02" "$(priced "$W/p5m.jsonl" p2 claude-opus-5     700000)"
-check "1h Sonnet 700K -> 0.7 x \$5.70"    "cache 59m \$3.99"  "$(priced "$W/p1h.jsonl" p3 claude-sonnet-5   700000)"
+check "1h Sonnet 5   700K -> 0.7 x \$3.80" "cache 59m \$2.66" "$(priced "$W/p1h.jsonl" p3 claude-sonnet-5   700000)"
+# Sonnet 5 is $2/Mtok and Sonnet 4.6 is $3. They shared a price table entry
+# until they did not; pin both so the split cannot silently collapse again.
+check "1h Sonnet 4.6 700K -> 0.7 x \$5.70" "cache 59m \$3.99" "$(priced "$W/p1h.jsonl" p3b claude-sonnet-4-6 700000)"
 check "1h Haiku  700K -> 0.7 x \$1.90"    "cache 59m \$1.33"  "$(priced "$W/p1h.jsonl" p4 claude-haiku-4-5  700000)"
 check "1h Fable  700K -> 0.7 x \$19.00"   "cache 59m \$13.30" "$(priced "$W/p1h.jsonl" p5 claude-fable-5    700000)"
 check "1h Fable    1M -> no overflow"     "cache 59m \$19.00" "$(priced "$W/p1h.jsonl" p6 claude-fable-5   1000000)"

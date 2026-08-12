@@ -175,10 +175,10 @@ CLAUDE_CACHE_STATUS_PRICING=5      # $5.00 per million input tokens
 CLAUDE_CACHE_STATUS_PRICING=12.50
 ```
 
-Two things it does not model: Sonnet 5's introductory rate (through
-2026-08-31, which makes the figure conservative until then), and the
-long-context premium that applies to Sonnet above 200K tokens. Both err toward
-understating, never overstating. Figures under ten cents are suppressed as noise.
+Not modelled: the 1.1x data-residency multiplier that applies when inference is
+pinned to a single region, and the 1.1x premium on regional endpoints under
+Bedrock and Google Cloud. Both err toward understating, never overstating.
+Figures under ten cents are suppressed as noise.
 
 ### Render cost
 
@@ -298,7 +298,7 @@ SH=dash sh tests/claude-cache-status.test.sh  # script under a named shell
 `SH` selects the shell the *script* is executed with, which is what the
 portability claim is about. It is independent of the shell running the harness.
 
-58 checks: tier detection on both tiers and on a mixed write, every display
+59 checks: tier detection on both tiers and on a mixed write, every display
 granularity boundary, all six colour bands, tier memory across a write-free
 window, subagent exclusion, `NO_COLOR`, corrupt state files, path traversal via
 `session_id`, control-character stripping, nine malformed or hostile inputs
