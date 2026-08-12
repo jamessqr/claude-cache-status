@@ -1,5 +1,7 @@
 # claude-cache-status
 
+[![tests](https://github.com/jamessqr/claude-cache-status/actions/workflows/test.yml/badge.svg)](https://github.com/jamessqr/claude-cache-status/actions/workflows/test.yml)
+
 A status line segment for [Claude Code](https://code.claude.com) that shows how
 long your prompt cache stays warm.
 
@@ -289,8 +291,12 @@ Properties worth stating explicitly:
 ## Development
 
 ```sh
-sh tests/claude-cache-status.test.sh
+sh tests/claude-cache-status.test.sh          # script under /bin/sh
+SH=dash sh tests/claude-cache-status.test.sh  # script under a named shell
 ```
+
+`SH` selects the shell the *script* is executed with, which is what the
+portability claim is about. It is independent of the shell running the harness.
 
 58 checks: tier detection on both tiers and on a mixed write, every display
 granularity boundary, all six colour bands, tier memory across a write-free
@@ -302,7 +308,10 @@ garbage prices producing no figure, and a 1M-token context confirming the
 integer maths cannot overflow. Fixtures are generated at run time
 because every meaningful case is relative to the current time.
 
-The suite runs the script under `sh`, `dash` and `bash`.
+CI runs the suite on every push across six combinations: `sh`, `dash` and `bash`
+on Linux, and `sh`, `bash` and `zsh` on macOS. That spread is deliberate — it
+covers GNU against BSD `stat` and `date`, and bash 5 against the bash 3.2 that
+ships on macOS, which is where portability bugs in a script like this surface.
 
 ## Prior art
 

@@ -1,14 +1,21 @@
 #!/bin/sh
 # Test suite for claude-cache-status.sh
 #
-#   sh tests/run.sh            # run against ../claude-cache-status.sh
-#   SCRIPT=/path/to/x.sh sh tests/run.sh
+#   sh tests/claude-cache-status.test.sh
+#   SCRIPT=/path/to/x.sh sh tests/claude-cache-status.test.sh
+#   SH=dash sh tests/claude-cache-status.test.sh
+#
+# SH is the shell the script under test is executed with, which is the thing
+# portability claims are about. It is independent of the shell running this
+# harness: `bash tests/...` with SH unset still exercises the script under sh.
 #
 # Fixtures are generated at run time rather than committed, because every
 # meaningful case depends on a timestamp relative to now. No control characters
 # are written literally into this file; they are produced via printf.
 
 SCRIPT=${SCRIPT:-$(cd "$(dirname "$0")/.." && pwd)/claude-cache-status.sh}
+SH=${SH:-sh}
+command -v "$SH" >/dev/null 2>&1 || { echo "no such shell: $SH" >&2; exit 1; }
 W=$(mktemp -d) || exit 1
 export XDG_CACHE_HOME="$W/cache"
 trap 'rm -rf "$W"' EXIT INT TERM
@@ -38,9 +45,9 @@ fixture() {
 }
 
 run() {  # run <transcript> <session> -> stripped output
-  jq -nc --arg t "$1" --arg s "$2" '{transcript_path:$t,session_id:$s}' | sh "$SCRIPT" 2>&1 | strip
+  jq -nc --arg t "$1" --arg s "$2" '{transcript_path:$t,session_id:$s}' | "$SH" "$SCRIPT" 2>&1 | strip
 }
-run_raw() { jq -nc --arg t "$1" --arg s "$2" '{transcript_path:$t,session_id:$s}' | sh "$SCRIPT" 2>&1; }
+run_raw() { jq -nc --arg t "$1" --arg s "$2" '{transcript_path:$t,session_id:$s}' | "$SH" "$SCRIPT" 2>&1; }
 
 check() {  # check <label> <expected> <actual>
   if [ "$2" = "$3" ]; then
@@ -56,7 +63,21 @@ contains() {  # contains <label> <needle> <haystack>
   esac
 }
 
+# Any assertion on a rendered value that shows seconds is racing the wall clock:
+# the fixture stamps a timestamp, and the script reads the clock again a moment
+# later. When a second ticks over in between, the value is one lower and the
+# check is wrong about nothing. Accept the next second down as well. Values that
+# render only whole minutes are not affected and use plain check().
+check_t() {  # check_t <label> <expected> <expected-one-second-later> <actual>
+  if [ "$2" = "$4" ] || [ "$3" = "$4" ]; then
+    pass=$((pass+1)); printf '  ok   %-46s %s\n' "$1" "$4"
+  else
+    fail=$((fail+1)); printf '  FAIL %-46s got [%s] want [%s] or [%s]\n' "$1" "$4" "$2" "$3"
+  fi
+}
+
 echo "script: $SCRIPT"
+echo "shell:  $SH ($("$SH" -c 'echo ${BASH_VERSION:-POSIX sh}' 2>/dev/null))"
 echo
 
 echo "-- syntax --------------------------------------------------------------"
@@ -72,18 +93,18 @@ done
 echo
 echo "-- tier detection ------------------------------------------------------"
 fixture "$W/h1.jsonl"    30 5000 0;    check "1h tier, 30s elapsed"   "cache 59m"  "$(run "$W/h1.jsonl" s1)"
-fixture "$W/m5.jsonl"    30 0 5000;    check "5m tier, 30s elapsed"   "cache 4:30" "$(run "$W/m5.jsonl" s2)"
-fixture "$W/mixed.jsonl" 30 5000 1200; check "mixed write -> shorter" "cache 4:30" "$(run "$W/mixed.jsonl" s3)"
+fixture "$W/m5.jsonl"    30 0 5000;    check_t "5m tier, 30s elapsed"   "cache 4:30" "cache 4:29" "$(run "$W/m5.jsonl" s2)"
+fixture "$W/mixed.jsonl" 30 5000 1200; check_t "mixed write -> shorter" "cache 4:30" "cache 4:29" "$(run "$W/mixed.jsonl" s3)"
 
 echo
 echo "-- adaptive granularity ------------------------------------------------"
 fixture "$W/g1.jsonl" 30   5000 0; check "1h, 59m left  -> coarse minutes" "cache 59m"  "$(run "$W/g1.jsonl" g1)"
-fixture "$W/g2.jsonl" 3000 5000 0; check "1h, 10m left  -> coarse minutes" "cache 10m"  "$(run "$W/g2.jsonl" g2)"
-fixture "$W/g3.jsonl" 3100 5000 0; check "1h, 8m left   -> M:SS"           "cache 8:20" "$(run "$W/g3.jsonl" g3)"
-fixture "$W/g4.jsonl" 3570 5000 0; check "1h, 30s left  -> seconds"        "cache 30s"  "$(run "$W/g4.jsonl" g4)"
+fixture "$W/g2.jsonl" 3000 5000 0; check_t "1h, 10m left  -> coarse minutes" "cache 10m"  "cache 9:59"  "$(run "$W/g2.jsonl" g2)"
+fixture "$W/g3.jsonl" 3100 5000 0; check_t "1h, 8m left   -> M:SS"           "cache 8:20" "cache 8:19" "$(run "$W/g3.jsonl" g3)"
+fixture "$W/g4.jsonl" 3570 5000 0; check_t "1h, 30s left  -> seconds"        "cache 30s"  "cache 29s"  "$(run "$W/g4.jsonl" g4)"
 fixture "$W/g5.jsonl" 7200 5000 0; check "1h, expired   -> cold"           "cache cold" "$(run "$W/g5.jsonl" g5)"
-fixture "$W/g6.jsonl" 30   0 5000; check "5m, 4:30 left -> M:SS"           "cache 4:30" "$(run "$W/g6.jsonl" g6)"
-fixture "$W/g7.jsonl" 250  0 5000; check "5m, 50s left  -> seconds"        "cache 50s"  "$(run "$W/g7.jsonl" g7)"
+fixture "$W/g6.jsonl" 30   0 5000; check_t "5m, 4:30 left -> M:SS"           "cache 4:30" "cache 4:29" "$(run "$W/g6.jsonl" g6)"
+fixture "$W/g7.jsonl" 250  0 5000; check_t "5m, 50s left  -> seconds"        "cache 50s"  "cache 49s"  "$(run "$W/g7.jsonl" g7)"
 
 echo
 echo "-- colour bands are fractions of the detected tier ---------------------"
@@ -122,7 +143,7 @@ check "subagent 5m write ignored" "cache 59m" "$(run "$W/sc.jsonl" sc)"
 echo
 echo "-- NO_COLOR ------------------------------------------------------------"
 fixture "$W/nc.jsonl" 30 5000 0
-_o=$(NO_COLOR=1 jq -nc --arg t "$W/nc.jsonl" --arg s nc '{transcript_path:$t,session_id:$s}' | NO_COLOR=1 sh "$SCRIPT")
+_o=$(NO_COLOR=1 jq -nc --arg t "$W/nc.jsonl" --arg s nc '{transcript_path:$t,session_id:$s}' | NO_COLOR=1 "$SH" "$SCRIPT")
 case "$_o" in
   *"$ESC"*) fail=$((fail+1)); printf '  FAIL %-46s escapes still present\n' "NO_COLOR=1 emits no escapes" ;;
   *) pass=$((pass+1)); printf '  ok   %-46s %s\n' "NO_COLOR=1 emits no escapes" "$_o" ;;
@@ -144,8 +165,8 @@ for n in bad empty garbage hostile fifo; do
 done
 check "missing file"      "" "$(run /nope/missing.jsonl zm)"
 check "directory as path" "" "$(run "$W" zd)"
-check "no transcript field" "" "$(printf '{}' | sh "$SCRIPT" 2>&1 | strip)"
-_o=$(jq -nc --arg t '/tmp/back\slash' '{transcript_path:$t,session_id:"zb"}' | sh "$SCRIPT" 2>&1 | strip)
+check "no transcript field" "" "$(printf '{}' | "$SH" "$SCRIPT" 2>&1 | strip)"
+_o=$(jq -nc --arg t '/tmp/back\slash' '{transcript_path:$t,session_id:"zb"}' | "$SH" "$SCRIPT" 2>&1 | strip)
 check "backslash in JSON parses" "" "$_o"
 
 echo
@@ -172,7 +193,7 @@ fi
 echo
 echo "-- control characters cannot reach the output --------------------------"
 _o=$(jq -nc --arg t "$W/h1.jsonl" --arg s nc2 --arg esc "$(printf '\033')" \
-  '{transcript_path:($t + $esc + "]0;x"),session_id:$s}' | sh "$SCRIPT" 2>&1)
+  '{transcript_path:($t + $esc + "]0;x"),session_id:$s}' | "$SH" "$SCRIPT" 2>&1)
 case "$_o" in
   *"]0;x"*) fail=$((fail+1)); printf '  FAIL %-46s escape reached output\n' "ESC in transcript_path stripped" ;;
   *) pass=$((pass+1)); printf '  ok   %-46s\n' "ESC in transcript_path stripped" ;;
@@ -185,7 +206,7 @@ echo "-- cost at risk (opt-in) -----------------------------------------------"
 priced() {  # priced <transcript> <session> <model-id> <ctx-tokens> [pricing-env]
   jq -nc --arg t "$1" --arg s "$2" --arg m "$3" --argjson n "$4" \
     '{transcript_path:$t,session_id:$s,model:{id:$m},context_window:{total_input_tokens:$n}}' \
-    | CLAUDE_CACHE_STATUS_PRICING="${5:-api}" sh "$SCRIPT" 2>&1 | strip
+    | CLAUDE_CACHE_STATUS_PRICING="${5:-api}" "$SH" "$SCRIPT" 2>&1 | strip
 }
 fixture "$W/p1h.jsonl" 30 5000 0
 fixture "$W/p5m.jsonl" 30 0 5000
@@ -193,11 +214,11 @@ fixture "$W/p5m.jsonl" 30 0 5000
 # default off: no env var means no figure at all
 _o=$(jq -nc --arg t "$W/p1h.jsonl" --arg s pd --arg m claude-opus-5 \
   '{transcript_path:$t,session_id:$s,model:{id:$m},context_window:{total_input_tokens:700000}}' \
-  | sh "$SCRIPT" 2>&1 | strip)
+  | "$SH" "$SCRIPT" 2>&1 | strip)
 check "off by default (no env var)"        "cache 59m"        "$_o"
 
 check "1h Opus   700K -> 0.7 x \$9.50"    "cache 59m \$6.65"  "$(priced "$W/p1h.jsonl" p1 claude-opus-5     700000)"
-check "5m Opus   700K -> 0.7 x \$5.75"    "cache 4:30 \$4.02" "$(priced "$W/p5m.jsonl" p2 claude-opus-5     700000)"
+check_t "5m Opus 700K -> 0.7 x \$5.75"   "cache 4:30 \$4.02" "cache 4:29 \$4.02" "$(priced "$W/p5m.jsonl" p2 claude-opus-5     700000)"
 check "1h Sonnet 700K -> 0.7 x \$5.70"    "cache 59m \$3.99"  "$(priced "$W/p1h.jsonl" p3 claude-sonnet-5   700000)"
 check "1h Haiku  700K -> 0.7 x \$1.90"    "cache 59m \$1.33"  "$(priced "$W/p1h.jsonl" p4 claude-haiku-4-5  700000)"
 check "1h Fable  700K -> 0.7 x \$19.00"   "cache 59m \$13.30" "$(priced "$W/p1h.jsonl" p5 claude-fable-5    700000)"

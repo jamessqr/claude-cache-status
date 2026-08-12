@@ -1,0 +1,58 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  # The script leans on stat, date and jq, whose behaviour differs by platform
+  # and drifts with runner images. A weekly run catches that without a commit.
+  schedule:
+    - cron: '0 14 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / ${{ matrix.sh }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux: GNU coreutils, bash 5.x, and dash as /bin/sh.
+          - { os: ubuntu-latest, sh: sh }
+          - { os: ubuntu-latest, sh: dash }
+          - { os: ubuntu-latest, sh: bash }
+          # macOS: BSD coreutils and bash 3.2, which is what most Claude Code
+          # users actually run. zsh is the default login shell there.
+          - { os: macos-latest, sh: sh }
+          - { os: macos-latest, sh: bash }
+          - { os: macos-latest, sh: zsh }
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install jq and ${{ matrix.sh }} if missing
+        shell: bash
+        run: |
+          set -eu
+          need() { ! command -v "$1" >/dev/null 2>&1; }
+          if need jq || need "${{ matrix.sh }}"; then
+            if [ "$RUNNER_OS" = Linux ]; then
+              sudo apt-get update -qq
+              need jq && sudo apt-get install -y -qq jq || true
+              need "${{ matrix.sh }}" && sudo apt-get install -y -qq "${{ matrix.sh }}" || true
+            else
+              need jq && brew install jq || true
+              need "${{ matrix.sh }}" && brew install "${{ matrix.sh }}" || true
+            fi
+          fi
+          jq --version
+          command -v "${{ matrix.sh }}"
+
+      - name: Run suite with the script under ${{ matrix.sh }}
+        env:
+          SH: ${{ matrix.sh }}
+        run: sh tests/claude-cache-status.test.sh
