@@ -139,9 +139,9 @@ _is_token() {
 _price_cents_per_mtok() {
   case "$1" in
     *fable-5* | *mythos-5*) echo 1000 ;;
-    *opus-5* | *opus-4-8* | *opus-4-7* | *opus-4-6*) echo 500 ;;
+    *opus-5* | *opus-4-8* | *opus-4-7* | *opus-4-6* | *opus-4-5*) echo 500 ;;
     *sonnet-5*) echo 200 ;;
-    *sonnet-4-6*) echo 300 ;;
+    *sonnet-4-6* | *sonnet-4-5*) echo 300 ;;
     *haiku-4-5*) echo 100 ;;
     *) echo "" ;;
   esac
