@@ -28,6 +28,17 @@ There are two cache lifetimes. The API default is **5 minutes**; there is an
 opt-in **1-hour** tier that costs 2× on writes. Claude Code chooses, and it does
 not tell you which one you got.
 
+The choosing is [documented
+behaviour](https://code.claude.com/docs/en/prompt-caching#cache-lifetime): a
+Claude subscription gets the 1-hour tier, an API key or cloud provider stays on
+5 minutes, and a subscription session that runs into overage drops to 5 minutes
+mid-session. Two environment variables (`ENABLE_PROMPT_CACHING_1H`,
+`FORCE_PROMPT_CACHING_5M`) override it in either direction — including from
+managed settings you may not control. So the rules are knowable; the *active*
+tier still is not. Nothing in the UI or the status line input says which one
+this session is on, and predicting it means re-implementing that policy table
+and every future revision of it.
+
 Guessing is not a small error. Assume 5 minutes on a 1-hour session and you will
 be told the cache is dead with 55 minutes still on the clock. Assume 1 hour on a
 5-minute session and you will be told you have 50 minutes of warmth that does not
@@ -53,7 +64,7 @@ This reads the tier out of your transcript, per session, and keeps reading it.
 Requires `jq` 1.5 or newer (`brew install jq` / `apt install jq`).
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/jamessqr/claude-cache-status/v1.0.0/claude-cache-status.sh \
+curl -fsSL https://raw.githubusercontent.com/jamessqr/claude-cache-status/v1.1.0/claude-cache-status.sh \
   -o ~/.claude/claude-cache-status.sh
 chmod +x ~/.claude/claude-cache-status.sh
 ```
@@ -91,6 +102,27 @@ git clone https://github.com/jamessqr/claude-cache-status
 
 Already have a status line? See [Adding this to an existing status
 line](#adding-this-to-an-existing-status-line).
+
+### Or have Claude Code install it
+
+The same result, delegated. In any Claude Code session, prompt:
+
+```text
+/statusline Add https://github.com/jamessqr/claude-cache-status to my status
+line. Put it on a newline beneath everything else, and set refreshInterval
+to 30.
+```
+
+and allow the permission prompts as Claude fetches the script and edits your
+settings. This is the easy path when you already have a status line you like:
+Claude does the merging described in [Adding this to an existing status
+line](#adding-this-to-an-existing-status-line) for you. Say `refreshInterval`
+explicitly — without it the countdown freezes while you sit at the prompt.
+
+The tradeoff is the obvious one: what runs is whatever was fetched from `main`,
+not the tag you audited, and the reading has been delegated to the model. The
+script lands on disk either way, so it can still be read — just after the fact
+rather than before.
 
 ## What you see
 
@@ -139,7 +171,10 @@ assistant entry instead would overstate remaining time by the whole streaming
 duration of a long turn.
 
 Subagent turns are excluded. A subagent runs against its own cache prefix, so its
-activity must not refresh the main conversation's countdown.
+activity must not refresh the main conversation's countdown. (The docs now
+confirm both halves: subagents build a separate cache of their own, and they use
+the 5-minute TTL even when the main conversation is on the 1-hour tier — so
+counting a subagent write would also poison tier detection.)
 
 ### Two behaviours that matter more than the detection itself
 
@@ -179,10 +214,10 @@ is what your next message costs extra.
 dollar figure would imply a cost you will never see. Nothing in the status line
 input reveals which billing you are on, so the opt-in is the signal.
 
-The price table covers Fable 5, Mythos 5, Opus 5 / 4.8 / 4.7 / 4.6, Sonnet 5 /
-4.6 and Haiku 4.5 at list input rates. An unrecognised model shows no figure
-rather than a guess. To price a model that is missing, or if your rates are not
-list rates, give the number instead of `api`:
+The price table covers Fable 5, Mythos 5, Opus 5 / 4.8 / 4.7 / 4.6 / 4.5,
+Sonnet 5 / 4.6 / 4.5 and Haiku 4.5 at list input rates. An unrecognised model
+shows no figure rather than a guess. To price a model that is missing, or if
+your rates are not list rates, give the number instead of `api`:
 
 ```sh
 CLAUDE_CACHE_STATUS_PRICING=5      # $5.00 per million input tokens
@@ -284,11 +319,18 @@ Properties worth stating explicitly:
 
 - **It depends on transcript fields that are not a documented contract** —
   `.type`, `.isSidechain` and `.message.usage.cache_creation`. The status line
-  *input* schema is documented and stable; the transcript JSONL shape is not. If
-  a Claude Code release renames those, the segment vanishes silently and needs a
-  fix. This is unavoidable for tier detection: the 1h/5m split appears nowhere
-  else, and the status line's own JSON carries only aggregate cache counts. The
-  state cache limits it to roughly one read per turn rather than one per render.
+  *input* schema is documented and stable; the transcript JSONL shape is not,
+  and the docs [say so
+  explicitly](https://code.claude.com/docs/en/sessions): the entry format is
+  internal and can change between versions. If a release renames those fields,
+  the segment vanishes silently and needs a fix. This is unavoidable for tier
+  detection: the 1h/5m split appears nowhere else — the status line's own JSON
+  gained aggregate cache counts (`context_window.current_usage.cache_*`), but
+  no tier. The state cache limits the exposure to roughly one transcript read
+  per turn rather than one per render.
+- **With prompt caching disabled** (`DISABLE_PROMPT_CACHING` and its per-model
+  variants), no cache write ever appears and the segment reads `cache ?`
+  indefinitely — which is accurate, if unhelpful: there is no cache to time.
 - **A conversation can hold up to four cache breakpoints**, each with its own
   lifetime. This reports one number, tracking the prefix every request reads.
 - **`/compact` destroys the prefix.** For the window between compaction and your
@@ -312,7 +354,7 @@ SH=dash sh tests/claude-cache-status.test.sh  # script under a named shell
 `SH` selects the shell the *script* is executed with, which is what the
 portability claim is about. It is independent of the shell running the harness.
 
-59 checks: tier detection on both tiers and on a mixed write, every display
+61 checks: tier detection on both tiers and on a mixed write, every display
 granularity boundary, all six colour bands, tier memory across a write-free
 window, subagent exclusion, `NO_COLOR`, corrupt state files, path traversal via
 `session_id`, control-character stripping, nine malformed or hostile inputs

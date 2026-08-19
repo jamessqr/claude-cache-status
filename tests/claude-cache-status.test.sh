@@ -223,6 +223,10 @@ check "1h Sonnet 5   700K -> 0.7 x \$3.80" "cache 59m \$2.66" "$(priced "$W/p1h.
 # Sonnet 5 is $2/Mtok and Sonnet 4.6 is $3. They shared a price table entry
 # until they did not; pin both so the split cannot silently collapse again.
 check "1h Sonnet 4.6 700K -> 0.7 x \$5.70" "cache 59m \$3.99" "$(priced "$W/p1h.jsonl" p3b claude-sonnet-4-6 700000)"
+# Opus 4.5 and Sonnet 4.5 carry dated snapshot ids, unlike everything newer;
+# these also pin that the table's substring match works on the dated form.
+check "1h Sonnet 4.5 700K -> 0.7 x \$5.70" "cache 59m \$3.99" "$(priced "$W/p1h.jsonl" p3c claude-sonnet-4-5-20250929 700000)"
+check "1h Opus 4.5  700K -> 0.7 x \$9.50"  "cache 59m \$6.65" "$(priced "$W/p1h.jsonl" p3d claude-opus-4-5-20251101  700000)"
 check "1h Haiku  700K -> 0.7 x \$1.90"    "cache 59m \$1.33"  "$(priced "$W/p1h.jsonl" p4 claude-haiku-4-5  700000)"
 check "1h Fable  700K -> 0.7 x \$19.00"   "cache 59m \$13.30" "$(priced "$W/p1h.jsonl" p5 claude-fable-5    700000)"
 check "1h Fable    1M -> no overflow"     "cache 59m \$19.00" "$(priced "$W/p1h.jsonl" p6 claude-fable-5   1000000)"
