@@ -64,7 +64,7 @@ This reads the tier out of your transcript, per session, and keeps reading it.
 Requires `jq` 1.5 or newer (`brew install jq` / `apt install jq`).
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/jamessqr/claude-cache-status/v1.0.0/claude-cache-status.sh \
+curl -fsSL https://raw.githubusercontent.com/jamessqr/claude-cache-status/v1.1.0/claude-cache-status.sh \
   -o ~/.claude/claude-cache-status.sh
 chmod +x ~/.claude/claude-cache-status.sh
 ```
