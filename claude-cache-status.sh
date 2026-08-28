@@ -22,17 +22,18 @@
 #   Reads:   the JSON Claude Code sends on stdin; the tail of the session
 #            transcript named in that JSON; its own small state file.
 #   Writes:  one state file per session under $XDG_CACHE_HOME (or ~/.cache),
-#            holding three fields — tier, anchor timestamp, and a change token
-#            derived from the transcript's mtime and size. No conversation
-#            content. Files unused for 7 days are pruned. Nothing else is
-#            written anywhere.
+#            holding four integers — tier, anchor timestamp, a change token
+#            derived from the transcript's mtime and size, and a pricing
+#            multiplier. No conversation content. Files unused for 7 days are
+#            pruned. Nothing else is written anywhere.
 #   Sends:   nothing. There are no network calls of any kind.
 #   Executes: jq, tail, stat, date, mkdir, mv, find, basename, tr. No eval, no
 #            sudo, no dynamic command construction.
-#   Extracts from the transcript: two timestamps and two integer token counts.
-#            No message content, no prompts, no tool output. The only strings
-#            this script can print are "cache <value>", "cache cold" and
-#            "cache ?", each optionally followed by a dollar figure when
+#   Extracts from the transcript: two timestamps, two integer token counts and
+#            the inference-geography flag of the last response. No message
+#            content, no prompts, no tool output. The only strings this script
+#            can print are "cache <value>", "cache cold" and "cache ?", each
+#            optionally followed by a dollar figure when
 #            CLAUDE_CACHE_STATUS_PRICING is set.
 #
 # INSTALL
@@ -136,14 +137,32 @@ _is_token() {
 # price means no figure is shown — a wrong number is worse than no number.
 # Supply your own with CLAUDE_CACHE_STATUS_PRICING=<dollars per million> for a
 # model that is missing, or when your rates are not list rates.
+#
+# $2 is the session's fast_mode flag from the status line input. Fast mode is a
+# different price for the same model — $10/Mtok input on Opus 5 and Opus 4.8,
+# double the standard rate — and the cache multipliers stack on top of it, so a
+# fast-mode session that is priced at the standard rate shows half the real
+# figure. Only those two models have fast mode; the flag is ignored elsewhere.
 _price_cents_per_mtok() {
   case "$1" in
     *fable-5* | *mythos-5*) echo 1000 ;;
-    *opus-5* | *opus-4-8* | *opus-4-7* | *opus-4-6* | *opus-4-5*) echo 500 ;;
+    *opus-5* | *opus-4-8*) if [ "${2:-}" = true ]; then echo 1000; else echo 500; fi ;;
+    *opus-4-7* | *opus-4-6* | *opus-4-5*) echo 500 ;;
     *sonnet-5*) echo 200 ;;
     *sonnet-4-6* | *sonnet-4-5*) echo 300 ;;
     *haiku-4-5*) echo 100 ;;
     *) echo "" ;;
+  esac
+}
+
+# Validate the inference-geography multiplier read back from the state file.
+# Exactly two values exist: 100 (global routing, standard pricing) and 110
+# (US-only inference, which the API bills at 1.1x on every token category,
+# cache writes and reads included).
+_is_geo() {
+  case "$1" in
+    100 | 110) return 0 ;;
+    *) return 1 ;;
   esac
 }
 
@@ -169,13 +188,15 @@ ccs_fields=$(printf '%s' "$input" | jq -r '
     ((.session_id // "") | tostring | gsub("[^A-Za-z0-9_-]"; "") | .[0:64]),
     ((.transcript_path // "") | tostring | gsub("[[:cntrl:]]"; "")),
     ((.model.id // .model.display_name // "") | tostring | gsub("[^A-Za-z0-9._-]"; "")),
-    ((.context_window.total_input_tokens // "") | tostring)
+    ((.context_window.total_input_tokens // "") | tostring),
+    ((.fast_mode // false) | tostring | gsub("[^a-z]"; ""))
   ' 2>/dev/null)
 {
   IFS= read -r ccs_session
   IFS= read -r ccs_transcript
   IFS= read -r ccs_model
   IFS= read -r ccs_ctx_tokens
+  IFS= read -r ccs_fast
 } <<EOF
 $ccs_fields
 EOF
@@ -203,48 +224,70 @@ if [ -n "$ccs_transcript" ] && [ -f "$ccs_transcript" ] && [ -n "$ccs_session" ]
   ccs_state="$ccs_dir/$ccs_session"
 
   # --- try the cache -------------------------------------------------------
-  # State line: "<tier> <anchor_epoch> <change_token>". Validated on read even
-  # though we wrote it: a torn or hand-edited file must not reach arithmetic. A
-  # hit means the transcript has not changed since we last parsed it, so the
-  # anchor and tier are still current and there is no need to touch the
-  # transcript at all — which is the common case, because refreshInterval
-  # re-runs this script repeatedly while the session sits idle.
+  # State line: "<tier> <anchor_epoch> <change_token> <geo_multiplier>".
+  # Validated on read even though we wrote it: a torn or hand-edited file must
+  # not reach arithmetic. A hit means the transcript has not changed since we
+  # last parsed it, so the anchor and tier are still current and there is no
+  # need to touch the transcript at all — which is the common case, because
+  # refreshInterval re-runs this script repeatedly while the session sits idle.
+  # The fourth field was added in v1.2.0; a three-field file from an earlier
+  # release is still accepted and read as the standard (100) multiplier.
   ccs_tier=""
   ccs_anchor=""
+  ccs_geo=""
   if [ -f "$ccs_state" ] && [ -n "$ccs_token" ]; then
-    IFS=' ' read -r s_tier s_anchor s_token < "$ccs_state" 2>/dev/null
+    IFS=' ' read -r s_tier s_anchor s_token s_geo < "$ccs_state" 2>/dev/null
+    [ -z "$s_geo" ] && s_geo=100
     if _is_int "$s_tier" && _is_int "$s_anchor" && _is_token "$s_token" &&
-       [ "$s_tier" -gt 0 ]; then
+       _is_geo "$s_geo" && [ "$s_tier" -gt 0 ]; then
       if [ "$s_token" = "$ccs_token" ]; then
         ccs_tier="$s_tier"      # full hit: tier and anchor both reusable
         ccs_anchor="$s_anchor"
+        ccs_geo="$s_geo"
       else
         ccs_tier_prev="$s_tier" # stale: keep the remembered tier as a fallback
+        ccs_geo_prev="$s_geo"
       fi
     fi
   fi
 
   # --- parse the transcript only when it has changed -----------------------
   if [ -z "$ccs_anchor" ]; then
-    # Two values: the newest non-sidechain user-side entry (the prompt or tool
-    # result Claude Code appends immediately before firing a request — a closer
-    # anchor than the assistant timestamp, which is response *end*), and the
-    # tier from the most recent response that actually wrote to cache.
-    # Sidechain turns are excluded: a subagent refreshes its own prefix, not
-    # this conversation's. "-" marks an undeterminable tier so it can be
-    # distinguished from a determinable one.
-    ccs_raw=$(tail -n 200 "$ccs_transcript" 2>/dev/null | jq -rs '
+    # Three values: the newest user-side entry (the prompt or tool result
+    # Claude Code appends immediately before firing a request — a closer
+    # anchor than the assistant timestamp, which is response *end*), the tier
+    # from the most recent response that actually wrote to cache, and that
+    # response's inference geography. "-" marks an undeterminable tier so it
+    # can be distinguished from a determinable one.
+    #
+    # Subagents are excluded. Current builds keep each subagent's transcript in
+    # its own file under <session-id>/subagents/, so nothing of theirs is in
+    # this file to begin with; older builds interleaved subagent turns here
+    # flagged isSidechain, and the filter stays for them. Either way a subagent
+    # refreshes its own prefix, not this conversation's, and it writes at 5m
+    # even when the main conversation is on 1h — so counting one would also
+    # corrupt tier detection.
+    #
+    # 400 lines rather than 200: Claude Code now interleaves several small
+    # bookkeeping entries per turn (permission-mode, mode, last-prompt,
+    # ai-title, attachment ...), so the same number of lines covers fewer
+    # turns than it used to. The window is only a cost bound; the remembered
+    # tier covers any write-free stretch that exceeds it.
+    ccs_raw=$(tail -n 400 "$ccs_transcript" 2>/dev/null | jq -rs '
       def epoch: sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601;
       [ .[] | select(.isSidechain != true) ] as $main
       | ([ $main[] | select(.type == "user") | .timestamp // empty | epoch ] | max) as $start
       | ([ $main[] | select(.type == "assistant")
-             | .message.usage.cache_creation // empty
-             | select(((.ephemeral_1h_input_tokens // 0) + (.ephemeral_5m_input_tokens // 0)) > 0) ]
-         | last) as $cc
+             | .message.usage // empty
+             | select(((.cache_creation.ephemeral_1h_input_tokens // 0)
+                     + (.cache_creation.ephemeral_5m_input_tokens // 0)) > 0) ]
+         | last) as $u
+      | ($u.cache_creation) as $cc
       # Each request writes exactly one tier, and the tier can change mid-session
-      # (an account entering usage overage drops from 1h to 5m). The most recent
-      # write is therefore the operative tier. A tier change is accompanied by a
-      # full re-write at cache_read 0, so it is never missed.
+      # (a subscription that starts drawing on usage credits drops from 1h to
+      # 5m). The most recent write is therefore the operative tier. A tier
+      # change is accompanied by a full re-write at cache_read 0, so it is
+      # never missed.
       #
       # If a single write ever reports BOTH tiers, the shorter one wins: part of
       # the prefix dies in 5 minutes, and over-reporting warmth is the dangerous
@@ -252,9 +295,13 @@ if [ -n "$ccs_transcript" ] && [ -f "$ccs_transcript" ] && [ -n "$ccs_session" ]
       | (if $cc == null then "-"
          elif (($cc.ephemeral_5m_input_tokens // 0) > 0) then "300"
          else "3600" end) as $ttl
-      | if $start == null then empty else "\($ttl) \(($start | floor))" end
+      # inference_geo is "us" when the workspace pins inference to the US, which
+      # is billed at 1.1x across the board. Anything else ("global",
+      # "not_available", absent) is standard pricing.
+      | (if ($u.inference_geo // "") == "us" then "110" else "100" end) as $geo
+      | if $start == null then empty else "\($ttl) \(($start | floor)) \($geo)" end
     ' 2>/dev/null)
-    IFS=' ' read -r r_tier r_anchor <<EOF
+    IFS=' ' read -r r_tier r_anchor r_geo <<EOF
 $ccs_raw
 EOF
 
@@ -262,11 +309,15 @@ EOF
       ccs_anchor="$r_anchor"
       if _is_int "$r_tier" && [ "$r_tier" -gt 0 ]; then
         ccs_tier="$r_tier"
+        ccs_geo="$r_geo"
       elif _is_int "${ccs_tier_prev:-}" ; then
         # No cache write in this window, but we established the tier earlier in
         # this session. Remembering it is what lets us avoid defaulting to 5m.
+        # The geography travels with it: it was read from the same response.
         ccs_tier="$ccs_tier_prev"
+        ccs_geo="${ccs_geo_prev:-100}"
       fi
+      _is_geo "$ccs_geo" || ccs_geo=100
     fi
 
     # --- persist, best effort -------------------------------------------
@@ -277,7 +328,7 @@ EOF
     if [ -n "$ccs_tier" ] && [ -n "$ccs_anchor" ] && [ -n "$ccs_token" ]; then
       if mkdir -p "$ccs_dir" 2>/dev/null; then
         ccs_tmp="$ccs_state.$$"
-        if printf '%s %s %s\n' "$ccs_tier" "$ccs_anchor" "$ccs_token" >"$ccs_tmp" 2>/dev/null; then
+        if printf '%s %s %s %s\n' "$ccs_tier" "$ccs_anchor" "$ccs_token" "$ccs_geo" >"$ccs_tmp" 2>/dev/null; then
           mv -f "$ccs_tmp" "$ccs_state" 2>/dev/null || rm -f "$ccs_tmp" 2>/dev/null
         else
           rm -f "$ccs_tmp" 2>/dev/null
@@ -309,10 +360,16 @@ EOF
     # and the figure would imply a cost you will never see. Nothing in the
     # status line input says which billing you are on, so the opt-in IS the
     # signal. All arithmetic is integer cents; no shell float rounding.
+    #
+    # Two modifiers stack on the base price. Fast mode (Opus 5 / 4.8, from the
+    # fast_mode flag on stdin) doubles the input rate; it is applied only to
+    # the built-in table, because a hand-supplied price is taken as given.
+    # US-only inference (from the transcript, remembered with the tier) is a
+    # flat 1.1x on everything, so it applies to either.
     if [ -n "${CLAUDE_CACHE_STATUS_PRICING:-}" ] && _is_int "$ccs_ctx_tokens" &&
        [ "$ccs_ctx_tokens" -gt 0 ]; then
       case "$CLAUDE_CACHE_STATUS_PRICING" in
-        api) ccs_price=$(_price_cents_per_mtok "$ccs_model") ;;
+        api) ccs_price=$(_price_cents_per_mtok "$ccs_model" "$ccs_fast") ;;
         *.*) # dollars per million, one or two decimal places
           ccs_p_whole=${CLAUDE_CACHE_STATUS_PRICING%%.*}
           ccs_p_frac=${CLAUDE_CACHE_STATUS_PRICING#*.}00
@@ -327,7 +384,8 @@ EOF
         if [ "$ccs_tier" -ge 3600 ]; then ccs_mult=190; else ccs_mult=115; fi
         # Divide the token count first so the product cannot overflow a 32-bit
         # shell: (tokens/1000) * cents_per_mtok / 1000 == tokens * cents / 1e6
-        ccs_loss=$(( ccs_price * ccs_mult / 100 ))
+        _is_geo "${ccs_geo:-}" || ccs_geo=100
+        ccs_loss=$(( ccs_price * ccs_mult / 100 * ccs_geo / 100 ))
         cache_cents=$(( (ccs_ctx_tokens / 1000) * ccs_loss / 1000 ))
       fi
     fi
