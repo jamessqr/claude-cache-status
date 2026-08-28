@@ -30,13 +30,20 @@ iso_ago() {  # $1 = seconds ago -> ISO8601 with milliseconds
     date -u -d "@$_e" +%Y-%m-%dT%H:%M:%S.000Z
 }
 
-# fixture <file> <secs-ago> <1h-tokens> <5m-tokens> [sidechain-last]
+# fixture <file> <secs-ago> <1h-tokens> <5m-tokens> [sidechain-last | us | global]
+#   sidechain  appends a subagent 5m write flagged isSidechain (older builds
+#              interleaved these in the main transcript)
+#   us/global  sets usage.inference_geo on the write, as the API reports it
 fixture() {
   _f=$1; _ts=$(iso_ago "$2")
   printf '{"type":"user","timestamp":"%s","message":{}}\n' "$_ts" > "$_f"
+  case "${5:-}" in
+    us | global) _geo=",\"inference_geo\":\"$5\"" ;;
+    *) _geo="" ;;
+  esac
   if [ "$3" != "-" ]; then
-    printf '{"type":"assistant","timestamp":"%s","message":{"usage":{"cache_creation":{"ephemeral_1h_input_tokens":%s,"ephemeral_5m_input_tokens":%s}}}}\n' \
-      "$_ts" "$3" "$4" >> "$_f"
+    printf '{"type":"assistant","timestamp":"%s","message":{"usage":{"cache_creation":{"ephemeral_1h_input_tokens":%s,"ephemeral_5m_input_tokens":%s}%s}}}\n' \
+      "$_ts" "$3" "$4" "$_geo" >> "$_f"
   fi
   if [ "${5:-}" = "sidechain" ]; then
     printf '{"type":"assistant","timestamp":"%s","isSidechain":true,"message":{"usage":{"cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":9999}}}}\n' \
@@ -175,10 +182,23 @@ fixture "$W/st.jsonl" 30 5000 0
 run "$W/st.jsonl" st >/dev/null
 _sf="$XDG_CACHE_HOME/claude-cache-status/st"
 contains "state file written" "3600" "$(cat "$_sf" 2>/dev/null)"
+check "state file has four fields, geo 100" "4 100" "$(awk '{print NF, $4}' "$_sf" 2>/dev/null)"
 for bad in "abc def ghi" "" "99999999999999999999 1 1" "3600 1" "3600 1 1 extra"; do
   printf '%s\n' "$bad" > "$_sf"
   check "corrupt state recomputes [$bad]" "cache 59m" "$(run "$W/st.jsonl" st)"
 done
+# A state file from before v1.2.0 has three fields. It must still be honoured
+# as a cache hit, not thrown away: prove it by planting a legacy line whose
+# anchor disagrees with the fixture (30m ago, not 30s) under the REAL change
+# token. Accepted -> 30m from the state; rejected -> 59m recomputed.
+run "$W/st.jsonl" st >/dev/null
+_tok=$(awk '{print $3}' "$_sf")
+printf '3600 %s %s\n' "$(( $(date +%s) - 1800 ))" "$_tok" > "$_sf"
+check_t "legacy 3-field state accepted" "cache 30m" "cache 29m" "$(run "$W/st.jsonl" st)"
+# The same line with a fourth field that is not a known multiplier is rejected
+# whole: a half-trusted line must not reach arithmetic.
+printf '3600 %s %s 999\n' "$(( $(date +%s) - 1800 ))" "$_tok" > "$_sf"
+check "unknown geo field rejects state"   "cache 59m" "$(run "$W/st.jsonl" st)"
 
 echo
 echo "-- path traversal in session_id ----------------------------------------"
@@ -203,9 +223,9 @@ echo
 echo "-- cost at risk (opt-in) -----------------------------------------------"
 # loss per Mtok = base_input_price x (write_multiplier - 0.1x read)
 #   1h tier: 1.9x   5m tier: 1.15x
-priced() {  # priced <transcript> <session> <model-id> <ctx-tokens> [pricing-env]
-  jq -nc --arg t "$1" --arg s "$2" --arg m "$3" --argjson n "$4" \
-    '{transcript_path:$t,session_id:$s,model:{id:$m},context_window:{total_input_tokens:$n}}' \
+priced() {  # priced <transcript> <session> <model-id> <ctx-tokens> [pricing-env] [fast_mode]
+  jq -nc --arg t "$1" --arg s "$2" --arg m "$3" --argjson n "$4" --argjson f "${6:-false}" \
+    '{transcript_path:$t,session_id:$s,model:{id:$m},context_window:{total_input_tokens:$n},fast_mode:$f}' \
     | CLAUDE_CACHE_STATUS_PRICING="${5:-api}" "$SH" "$SCRIPT" 2>&1 | strip
 }
 fixture "$W/p1h.jsonl" 30 5000 0
@@ -242,6 +262,46 @@ check "negative price  -> no figure"      "cache 59m"         "$(priced "$W/p1h.
 # risk", it is what the next message costs extra. That is the moment it matters.
 fixture "$W/pcold.jsonl" 7200 5000 0
 check "cold prices the next turn"         "cache cold \$6.65" "$(priced "$W/pcold.jsonl" pf claude-opus-5   700000)"
+
+echo
+echo "-- fast mode doubles Opus 5 / 4.8 input price ---------------------------"
+# Fast mode is $10/Mtok input on Opus 5 and Opus 4.8, and the cache multipliers
+# stack on top: 1h loss = 10 x 1.9 = $19.00/Mtok, 5m loss = 10 x 1.15 = $11.50.
+check "1h Opus 5   fast 700K -> 0.7 x \$19.00" "cache 59m \$13.30" "$(priced "$W/p1h.jsonl" f1 claude-opus-5   700000 api true)"
+check "1h Opus 4.8 fast 700K -> 0.7 x \$19.00" "cache 59m \$13.30" "$(priced "$W/p1h.jsonl" f2 claude-opus-4-8 700000 api true)"
+fixture "$W/f5m.jsonl" 30 0 5000   # fresh: an M:SS value is racing the clock
+check_t "5m Opus 5 fast 700K -> 0.7 x \$11.50" "cache 4:30 \$8.05" "cache 4:29 \$8.05" "$(priced "$W/f5m.jsonl" f3 claude-opus-5 700000 api true)"
+# Only those two models have fast mode. A stale flag must not double anything
+# else, and a hand-supplied price is taken as given.
+check "fast flag on Opus 4.7 -> standard"    "cache 59m \$6.65"  "$(priced "$W/p1h.jsonl" f4 claude-opus-4-7  700000 api true)"
+check "fast flag on Sonnet 5 -> standard"    "cache 59m \$2.66"  "$(priced "$W/p1h.jsonl" f5 claude-sonnet-5  700000 api true)"
+check "fast flag on Fable    -> standard"    "cache 59m \$13.30" "$(priced "$W/p1h.jsonl" f6 claude-fable-5   700000 api true)"
+check "fast flag + explicit price -> as given" "cache 59m \$6.65" "$(priced "$W/p1h.jsonl" f7 claude-opus-5    700000 5 true)"
+check "fast_mode false is the default"       "cache 59m \$6.65"  "$(priced "$W/p1h.jsonl" f8 claude-opus-5    700000 api false)"
+
+echo
+echo "-- US-only inference is 1.1x on everything ------------------------------"
+# usage.inference_geo is "us" when the workspace pins inference to the US; the
+# API bills every token category at 1.1x, cache writes and reads included.
+# Opus 1h: 9.50 x 1.1 = $10.45/Mtok; x 0.7M = $7.315 -> $7.31 (integer cents).
+fixture "$W/geo-us.jsonl" 30 5000 0 us
+fixture "$W/geo-gl.jsonl" 30 5000 0 global
+check "1h Opus  us 700K -> 0.7 x \$10.45"   "cache 59m \$7.31"  "$(priced "$W/geo-us.jsonl"  g1 claude-opus-5   700000)"
+check "1h Opus  global -> standard"         "cache 59m \$6.65"  "$(priced "$W/geo-gl.jsonl"  g2 claude-opus-5   700000)"
+check "1h Opus  absent -> standard"         "cache 59m \$6.65"  "$(priced "$W/p1h.jsonl"     g3 claude-opus-5   700000)"
+fixture "$W/geo-us5.jsonl" 30 0 5000 us   # fresh: an M:SS value is racing the clock
+check_t "5m Sonnet 5 us 700K -> 0.7 x \$2.53" "cache 4:30 \$1.77" "cache 4:29 \$1.77" "$(priced "$W/geo-us5.jsonl" g4 claude-sonnet-5 700000)"
+# It stacks with the other two price sources: fast mode, and a hand-supplied
+# rate (a contracted discount is still billed 1.1x for US-only inference).
+check "us + fast Opus 5  -> 0.7 x \$20.90"  "cache 59m \$14.63" "$(priced "$W/geo-us.jsonl"  g5 claude-opus-5   700000 api true)"
+check "us + explicit 5   -> 0.7 x \$10.45"  "cache 59m \$7.31"  "$(priced "$W/geo-us.jsonl"  g6 claude-future-9 700000 5)"
+# The geography was read from the same response as the tier, so it is
+# remembered the same way across a window that contains no cache write.
+fixture "$W/geo-mem.jsonl" 30 5000 0 us
+check "v1 establishes us"                   "cache 59m \$7.31"  "$(priced "$W/geo-mem.jsonl" g7 claude-opus-5   700000)"
+sleep 1
+fixture "$W/geo-mem.jsonl" 30 0 0
+check "v2 has no write, keeps us"           "cache 59m \$7.31"  "$(priced "$W/geo-mem.jsonl" g7 claude-opus-5   700000)"
 
 echo
 echo "========================================================================"
