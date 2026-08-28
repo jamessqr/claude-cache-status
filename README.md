@@ -22,31 +22,37 @@ On a large session that is the most expensive request you will make all day.
 
 Nothing in Claude Code tells you how long you have. This does.
 
-## The catch nobody handles well
+## Two cache lifetimes
 
 There are two cache lifetimes. The API default is **5 minutes**; there is an
-opt-in **1-hour** tier that costs 2× on writes. Claude Code chooses, and it does
-not tell you which one you got.
+opt-in **1-hour** tier that costs 2× on writes. Claude Code picks one per
+request, and nothing in the UI or the status line input says which one this
+session got.
 
-The choosing is [documented
-behaviour](https://code.claude.com/docs/en/prompt-caching#cache-lifetime): a
-Claude subscription gets the 1-hour tier, an API key or cloud provider stays on
-5 minutes, and a subscription session that runs into overage drops to 5 minutes
-mid-session. Two environment variables (`ENABLE_PROMPT_CACHING_1H`,
-`FORCE_PROMPT_CACHING_5M`) override it in either direction — including from
-managed settings you may not control. So the rules are knowable; the *active*
-tier still is not. Nothing in the UI or the status line input says which one
-this session is on, and predicting it means re-implementing that policy table
-and every future revision of it.
+The rules are
+[documented](https://code.claude.com/docs/en/prompt-caching#cache-lifetime),
+and they have grown. Requests fall into two buckets: the main conversation, and
+everything else (subagents, forks, compaction, session titles). By default the
+main conversation gets 1 hour on a Claude subscription within plan usage, and 5
+minutes on an API key, on a cloud provider, or once a subscription starts
+drawing on usage credits; the other bucket gets 5 minutes everywhere. Each
+bucket then has its own override — the `promptCacheTtl` and
+`subagentPromptCacheTtl` settings, or the `CLAUDE_CODE_PROMPT_CACHE_TTL` and
+`CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL` environment variables — and the older
+`ENABLE_PROMPT_CACHING_1H` and `FORCE_PROMPT_CACHING_5M` still sit above and
+below those in a five-step precedence order, any step of which can come from
+managed settings you do not control. Predicting the tier means re-implementing
+that table and tracking every revision of it. The docs' own suggestion for
+finding out is to run `claude -p "hello" --output-format json` and read
+`usage.cache_creation` from the result, which costs a request.
 
-Guessing is not a small error. Assume 5 minutes on a 1-hour session and you will
-be told the cache is dead with 55 minutes still on the clock. Assume 1 hour on a
-5-minute session and you will be told you have 50 minutes of warmth that does not
-exist.
+Getting it wrong is not a small error. Assume 5 minutes on a 1-hour session and
+the cache is reported dead with 55 minutes still on the clock. Assume 1 hour on
+a 5-minute session and 50 minutes of warmth are reported that do not exist.
 
-Worse, **the tier can change mid-session.** Here is a real transcript switching
-from the 5-minute tier to the 1-hour tier, paying a full 728,000-token re-write
-to do it:
+And the tier can change mid-session. Here is a real transcript switching from
+the 5-minute tier to the 1-hour tier, paying a full 728,000-token re-write to
+do it:
 
 ```
 20:23:40   5m   write 986       read 727254
@@ -54,17 +60,23 @@ to do it:
 20:24:26   1h   write 980       read 728046
 ```
 
-So a hardcoded constant is not merely a bad default — it can be wrong for a
-session it was right about ten minutes earlier.
+It can also change without anything changing on your side. In March 2026 a
+[report built on 120,000 logged API
+calls](https://github.com/anthropics/claude-code/issues/46829) saw 5-minute
+writes go from none to 83% of all cache writes within three days, at roughly
+17% more spend over the quarter, with no change to the user's configuration. A
+constant that was right in February was wrong in March.
 
-This reads the tier out of your transcript, per session, and keeps reading it.
+So the tier is read from the transcript, per session, and re-read as the
+session goes on. Each response records which tier it wrote to, and that record
+is the only place the split appears.
 
 ## Install
 
 Requires `jq` 1.5 or newer (`brew install jq` / `apt install jq`).
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/jamessqr/claude-cache-status/v1.1.0/claude-cache-status.sh \
+curl -fsSL https://raw.githubusercontent.com/jamessqr/claude-cache-status/v1.2.0/claude-cache-status.sh \
   -o ~/.claude/claude-cache-status.sh
 chmod +x ~/.claude/claude-cache-status.sh
 ```
@@ -170,11 +182,14 @@ from the start of the request, not the end of the response. Anchoring on the
 assistant entry instead would overstate remaining time by the whole streaming
 duration of a long turn.
 
-Subagent turns are excluded. A subagent runs against its own cache prefix, so its
-activity must not refresh the main conversation's countdown. (The docs now
-confirm both halves: subagents build a separate cache of their own, and they use
-the 5-minute TTL even when the main conversation is on the 1-hour tier — so
-counting a subagent write would also poison tier detection.)
+Subagent turns are excluded. A subagent runs against its own cache prefix, so
+its activity must not refresh the main conversation's countdown — and it writes
+at the 5-minute TTL even when the main conversation is on the 1-hour tier, so
+counting one would also corrupt tier detection. Current builds keep each
+subagent's transcript in its own file under `<session-id>/subagents/`, so
+nothing of theirs is in the main transcript to begin with; older builds
+interleaved subagent turns flagged `isSidechain`, and the filter for those
+stays in place.
 
 ### Two behaviours that matter more than the detection itself
 
@@ -217,17 +232,34 @@ input reveals which billing you are on, so the opt-in is the signal.
 The price table covers Fable 5, Mythos 5, Opus 5 / 4.8 / 4.7 / 4.6 / 4.5,
 Sonnet 5 / 4.6 / 4.5 and Haiku 4.5 at list input rates. An unrecognised model
 shows no figure rather than a guess. To price a model that is missing, or if
-your rates are not list rates, give the number instead of `api`:
+your rates are not list rates — including rates an organisation has set through
+the `modelPricing` managed setting, which this script cannot see — give the
+number instead of `api`:
 
 ```sh
 CLAUDE_CACHE_STATUS_PRICING=5      # $5.00 per million input tokens
 CLAUDE_CACHE_STATUS_PRICING=12.50
 ```
 
-Not modelled: the 1.1x data-residency multiplier that applies when inference is
-pinned to a single region, and the 1.1x premium on regional endpoints under
-Bedrock and Google Cloud. Both err toward understating, never overstating.
-Figures under ten cents are suppressed as noise.
+Two billing modifiers are applied on top of the base price:
+
+- **Fast mode.** `/fast` bills Opus 5 and Opus 4.8 input at $10/Mtok, double
+  the standard rate, and the cache multipliers stack on it — so a fast-mode
+  session priced at the standard rate would show half the real figure. The
+  status line input carries a `fast_mode` flag, and the table doubles those two
+  models when it is set. A hand-supplied number is taken as given. One
+  imprecision: during a fast-mode rate-limit cooldown Claude Code runs at
+  standard speed while the flag stays on, so the figure is briefly high — the
+  safe direction.
+- **US-only inference.** A workspace that pins inference to the US is billed
+  1.1x on every token category, cache reads and writes included. Each response
+  records this as `usage.inference_geo`, so it is read from the transcript
+  alongside the tier and remembered the same way. It applies to a hand-supplied
+  number too, since a contracted rate is still billed 1.1x.
+
+Not modelled: the 1.1x premium on regional endpoints under Bedrock and Google
+Cloud, which errs toward understating. Figures under ten cents are suppressed as
+noise.
 
 ### Render cost
 
@@ -266,7 +298,8 @@ variants by default) and `DIM` (drawn as 50%-alpha faint text).
 
 The script is marked with two blocks, `---- COMPUTE ----` and
 `---- RENDER ----`. Copy both into your own script along with the `_esc`,
-`_is_int`, `_stat_token` and `_is_token` helpers and the `C_*` colours. COMPUTE
+`_is_int`, `_stat_token`, `_is_token`, `_is_geo` and `_price_cents_per_mtok`
+helpers and the `C_*` colours. COMPUTE
 goes after the line where you read stdin into `$input`; RENDER goes wherever the
 segment belongs.
 
@@ -287,14 +320,14 @@ short enough to audit in one sitting.
 
 | | |
 |---|---|
-| **Reads** | stdin JSON from Claude Code; the last 200 lines of the transcript it names; its own state file |
-| **Writes** | one state file per session under `$XDG_CACHE_HOME`, holding three integers. No conversation content. Pruned after 7 days |
+| **Reads** | stdin JSON from Claude Code; the last 400 lines of the transcript it names; its own state file |
+| **Writes** | one state file per session under `$XDG_CACHE_HOME`, holding four integers. No conversation content. Pruned after 7 days |
 | **Sends** | nothing. There are no network calls — `grep -E 'curl\|wget\|nc \|ssh' claude-cache-status.sh` comes back empty |
 | **Runs** | `jq`, `tail`, `stat`, `date`, `mkdir`, `mv`, `find`, `basename`, `tr`. No `eval`, no `sudo`, no constructed commands |
 
-From the transcript it extracts two timestamps and two integer token counts. No
-message content, no prompts, no tool output. The only string it can print is
-`cache <value>`.
+From the transcript it extracts two timestamps, two integer token counts and the
+inference-geography flag of one response. No message content, no prompts, no
+tool output. The only string it can print is `cache <value>`.
 
 Properties worth stating explicitly:
 
@@ -318,7 +351,8 @@ Properties worth stating explicitly:
 ## Limitations
 
 - **It depends on transcript fields that are not a documented contract** —
-  `.type`, `.isSidechain` and `.message.usage.cache_creation`. The status line
+  `.type`, `.timestamp`, `.isSidechain`, `.message.usage.cache_creation` and
+  `.message.usage.inference_geo`. The status line
   *input* schema is documented and stable; the transcript JSONL shape is not,
   and the docs [say so
   explicitly](https://code.claude.com/docs/en/sessions): the entry format is
@@ -336,10 +370,15 @@ Properties worth stating explicitly:
 - **`/compact` destroys the prefix.** For the window between compaction and your
   next request, the countdown still refers to a prefix that no longer exists. It
   corrects itself on the following turn.
+- **A fork refreshes the cache invisibly.** A `fork` subagent inherits this
+  conversation's exact prefix, so its first request reads — and therefore
+  refreshes — this conversation's cache. Its transcript is a separate file, so
+  the countdown does not see that and can show less time than you actually have
+  while a fork is running. It corrects on your next turn.
 - **Timing is approximate.** The anchor is a proxy for request start, and the
   display only moves as often as `refreshInterval`.
 - **One input is unbounded.** A transcript consisting of a single enormous line
-  is handed to `jq` whole, because `tail -n 200` has nothing to trim. Real
+  is handed to `jq` whole, because `tail -n 400` has nothing to trim. Real
   transcripts are many small lines. A byte cap is not implemented because slicing
   mid-line would break the parse and disable the feature more often than the case
   it guards.
@@ -354,15 +393,18 @@ SH=dash sh tests/claude-cache-status.test.sh  # script under a named shell
 `SH` selects the shell the *script* is executed with, which is what the
 portability claim is about. It is independent of the shell running the harness.
 
-61 checks: tier detection on both tiers and on a mixed write, every display
+80 checks: tier detection on both tiers and on a mixed write, every display
 granularity boundary, all six colour bands, tier memory across a write-free
-window, subagent exclusion, `NO_COLOR`, corrupt state files, path traversal via
-`session_id`, control-character stripping, nine malformed or hostile inputs
-verified to omit the segment without hanging, and every pricing path — each
-model in the table hand-checked against the arithmetic, unknown models and
-garbage prices producing no figure, and a 1M-token context confirming the
-integer maths cannot overflow. Fixtures are generated at run time
-because every meaningful case is relative to the current time.
+window, subagent exclusion, `NO_COLOR`, corrupt state files and a pre-1.2.0
+three-field state file still honoured, path traversal via `session_id`,
+control-character stripping, nine malformed or hostile inputs verified to omit
+the segment without hanging, and every pricing path — each model in the table
+hand-checked against the arithmetic, fast mode on the two models that have it
+and on those that do not, US-only inference stacked with each price source and
+remembered across a write-free window, unknown models and garbage prices
+producing no figure, and a 1M-token context confirming the integer maths cannot
+overflow. Fixtures are generated at run time because every meaningful case is
+relative to the current time.
 
 CI runs the suite on every push across six combinations: `sh`, `dash` and `bash`
 on Linux, and `sh`, `bash` and `zsh` on macOS. That spread is deliberate — it
@@ -384,9 +426,13 @@ choosing:
   ~30 lines. TTL hardcoded to 3600 with instructions to hand-edit two files for
   the other tier.
 - **[fifthadj/claude-cache-keepalive](https://github.com/fifthadj/claude-cache-keepalive)**
-  — the other project doing genuine tier detection from `cache_creation`, and
-  additionally a PTY-host keepalive that injects a cheap request to hold the
-  cache open. If you would rather prevent expiry than watch it, start here.
+  — also detects the tier from `cache_creation`, and adds a PTY-host keepalive
+  that injects a cheap request to hold the cache open. If you would rather
+  prevent expiry than watch it, start here.
+- **[ilia-pluzhnikov/claude-code-statusline](https://github.com/ilia-pluzhnikov/claude-code-statusline)**
+  — a full status line in dependency-free Node.js (model, git state, context,
+  rate limits) whose cache segment detects the tier from the transcript the
+  same way this does, alongside read/write counters from the status line input.
 - **[cnighswonger/claude-code-coffee](https://github.com/cnighswonger/claude-code-coffee)**
   — infers the tier from quota state rather than from cache writes, and sets a
   cron cadence accordingly.
@@ -397,12 +443,11 @@ choosing:
 - **[jesserobbins gist](https://gist.github.com/jesserobbins/ff344a13f3b90cddb8e6b1e19e7e604e)**
   — the smallest version of the idea, in about 20 lines.
 
-What is different here: the tier is detected rather than configured, remembered
-across turns that write nothing, and reported as unknown rather than guessed when
-it has never been seen; and the countdown is anchored to request start rather
-than response end. The cost figure follows from the same detection: because the
-write multiplier differs by tier, knowing the tier is what makes the number
-correct.
+This one detects the tier rather than taking it as configuration, remembers it
+across turns that write nothing, and reports it as unknown rather than guessed
+when it has never been seen; the countdown is anchored to request start rather
+than response end. The cost figure follows from the same detection, since the
+write multiplier differs by tier.
 
 ## Licence
 
