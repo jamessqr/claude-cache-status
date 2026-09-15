@@ -304,6 +304,84 @@ fixture "$W/geo-mem.jsonl" 30 0 0
 check "v2 has no write, keeps us"           "cache 59m \$7.31"  "$(priced "$W/geo-mem.jsonl" g7 claude-opus-5   700000)"
 
 echo
+echo "-- prompt_cache on stdin (Claude Code >= 2.1.251) ----------------------"
+# Claude Code now hands the status line the tier and the expiry directly. When
+# both are present the transcript is not opened, so these run against a path
+# that does not exist.
+pc() {  # pc <ttl> <secs-until-expiry> [transcript] [session] -> stripped output
+  jq -nc --arg t "${3:-/nope/none.jsonl}" --arg s "${4:-pc}" --arg ttl "$1" \
+    --argjson e "$(( $(date +%s) + $2 ))" \
+    '{transcript_path:$t,session_id:$s,prompt_cache:{ttl:$ttl,expires_at:$e,caching_observed:true,warm:true}}' \
+    | "$SH" "$SCRIPT" 2>&1 | strip
+}
+pc_raw() {  # pc_raw <transcript> <session> <prompt_cache JSON literal>
+  jq -nc --arg t "$1" --arg s "$2" --argjson pc "$3" \
+    '{transcript_path:$t,session_id:$s,prompt_cache:$pc}' \
+    | "$SH" "$SCRIPT" 2>&1 | strip
+}
+check   "stdin 1h, 59m left, no transcript"  "cache 59m"  "$(pc 1h 3570)"
+check_t "stdin 5m, 4:30 left, no transcript" "cache 4:30" "cache 4:29" "$(pc 5m 270)"
+check   "stdin 1h, expired -> cold"          "cache cold" "$(pc 1h -120)"
+check   "stdin expiry past a full TTL clamps" "cache 60m" "$(pc 1h 7200)"
+check   "stdin expires_at as float is floored" "cache 59m" \
+  "$(pc_raw /nope/none.jsonl pcfl '{"ttl":"1h","expires_at":'"$(( $(date +%s) + 3570 ))"'.6,"caching_observed":true}')"
+# stdin wins when both are present: the transcript says 5m written 30 seconds
+# ago, stdin says 1h with 40 minutes left.
+fixture "$W/pcx.jsonl" 30 0 5000
+check_t "stdin overrides transcript tier+anchor" "cache 40m" "cache 39m" "$(pc 1h 2400 "$W/pcx.jsonl" pcx)"
+# And, unpriced, the transcript was never opened: no state file appeared.
+check   "unpriced stdin path writes no state" "" "$(ls "$XDG_CACHE_HOME/claude-cache-status/pcx" 2>/dev/null)"
+# Anything missing or malformed falls through to the transcript, which here
+# holds a 1h write 30 seconds old.
+fixture "$W/pcf.jsonl" 30 5000 0
+_soon=$(( $(date +%s) + 100 ))
+check "ttl unknown value -> transcript"       "cache 59m" "$(pc_raw "$W/pcf.jsonl" pcf1 '{"ttl":"2h","expires_at":'"$_soon"'}')"
+check "expires_at null -> transcript"         "cache 59m" "$(pc_raw "$W/pcf.jsonl" pcf2 '{"ttl":"1h","expires_at":null,"caching_observed":true}')"
+check "expires_at as string -> transcript"    "cache 59m" "$(pc_raw "$W/pcf.jsonl" pcf3 '{"ttl":"1h","expires_at":"'"$_soon"'"}')"
+check "prompt_cache not an object -> transcript" "cache 59m" "$(pc_raw "$W/pcf.jsonl" pcf4 '"junk"')"
+check "prompt_cache absent (older build)"     "cache 59m" "$(run "$W/pcf.jsonl" pcf5)"
+# caching_observed:false is Claude Code saying no response has carried cache
+# tokens. Nothing to count down; say so rather than staying silent.
+check "caching_observed false -> unknown"     "cache ?"   "$(pc_raw /nope/none.jsonl pcf6 '{"caching_observed":false,"warm":false,"expires_at":null}')"
+
+echo
+echo "-- pricing on the stdin path -------------------------------------------"
+# recache_tokens_if_cold is the purpose-built count ("tokens the next request
+# re-caches if the cache has gone cold") and is preferred; the context
+# window's total input is the fallback when it is null (right after /compact).
+pcp() {  # pcp <ttl> <secs> <model> <recache-tokens JSON> <total-input> [transcript] [session]
+  jq -nc --arg t "${6:-/nope/none.jsonl}" --arg s "${7:-pcp}" --arg ttl "$1" \
+    --argjson e "$(( $(date +%s) + $2 ))" --arg m "$3" --argjson rc "$4" --argjson n "$5" \
+    '{transcript_path:$t,session_id:$s,model:{id:$m},context_window:{total_input_tokens:$n},
+      prompt_cache:{ttl:$ttl,expires_at:$e,caching_observed:true,recache_tokens_if_cold:$rc}}' \
+    | CLAUDE_CACHE_STATUS_PRICING=api "$SH" "$SCRIPT" 2>&1 | strip
+}
+check   "recache tokens preferred over total"  "cache 59m \$6.65"  "$(pcp 1h 3570 claude-opus-5 700000 100)"
+check   "recache null -> total input tokens"   "cache 59m \$6.65"  "$(pcp 1h 3570 claude-opus-5 null 700000)"
+check_t "stdin 5m tier prices at 1.15x"        "cache 4:30 \$4.02" "cache 4:29 \$4.02" "$(pcp 5m 270 claude-opus-5 700000 0)"
+# US-only inference is recorded only in the transcript, so pricing still
+# consults it when stdin has settled the tier. The transcript here says 5m;
+# the tier and anchor nonetheless come from stdin, only the 1.1x is taken.
+fixture "$W/pcg.jsonl" 30 0 5000 us
+check   "stdin tier + transcript geography"    "cache 59m \$7.31"  "$(pcp 1h 3570 claude-opus-5 700000 0 "$W/pcg.jsonl" pcg)"
+
+echo
+echo "-- Fable 5.1 / Mythos 5.1 bill cache reads at 0.025x -------------------"
+# Reads are $0.25/Mtok against a $10 base, so the loss on expiry widens to
+# (2 - 0.025) = 1.975x on 1h and (1.25 - 0.025) = 1.225x on 5m: $19.75 and
+# $12.25 per Mtok. Fable 5 keeps the 0.1x read and $19.00.
+check "1h Fable 5.1  700K -> 0.7 x \$19.75"  "cache 59m \$13.82" "$(priced "$W/p1h.jsonl" q1 claude-fable-5-1  700000)"
+check "1h Mythos 5.1 700K -> 0.7 x \$19.75"  "cache 59m \$13.82" "$(priced "$W/p1h.jsonl" q2 claude-mythos-5-1 700000)"
+fixture "$W/q5m.jsonl" 30 0 5000   # fresh: an M:SS value is racing the clock
+check_t "5m Fable 5.1 700K -> 0.7 x \$12.25" "cache 4:30 \$8.57" "cache 4:29 \$8.57" "$(priced "$W/q5m.jsonl" q3 claude-fable-5-1 700000)"
+check "1h Fable 5    700K -> still \$19.00"  "cache 59m \$13.30" "$(priced "$W/p1h.jsonl" q4 claude-fable-5    700000)"
+# The read rate is a property of the model, so it follows a hand-supplied
+# base price too.
+check "explicit 10 + Fable 5.1 -> 0.7 x \$19.75" "cache 59m \$13.82" "$(priced "$W/p1h.jsonl" q5 claude-fable-5-1 700000 10)"
+fixture "$W/qus.jsonl" 30 5000 0 us
+check "us + Fable 5.1 -> 0.7 x \$21.72"      "cache 59m \$15.20" "$(priced "$W/qus.jsonl" q6 claude-fable-5-1 700000)"
+
+echo
 echo "========================================================================"
 printf 'passed %d, failed %d\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

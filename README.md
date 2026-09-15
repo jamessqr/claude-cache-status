@@ -20,14 +20,16 @@ for free every time you use it. Walk away for long enough and it expires — you
 next message silently re-pays the full write price on the entire conversation.
 On a large session that is the most expensive request you will make all day.
 
-Nothing in Claude Code tells you how long you have. This does.
+Claude Code's `/usage` will tell you whether the cache is warm right now.
+Nothing tells you how long you have left, or what it costs if you miss. This
+does.
 
 ## Two cache lifetimes
 
 There are two cache lifetimes. The API default is **5 minutes**; there is an
 opt-in **1-hour** tier that costs 2× on writes. Claude Code picks one per
-request, and nothing in the UI or the status line input says which one this
-session got.
+request, and until v2.1.251 nothing in the UI or the status line input said
+which one this session got.
 
 The rules are
 [documented](https://code.claude.com/docs/en/prompt-caching#cache-lifetime),
@@ -67,16 +69,18 @@ writes go from none to 83% of all cache writes within three days, at roughly
 17% more spend over the quarter, with no change to the user's configuration. A
 constant that was right in February was wrong in March.
 
-So the tier is read from the transcript, per session, and re-read as the
-session goes on. Each response records which tier it wrote to, and that record
-is the only place the split appears.
+So the tier is read, per session, and re-read as the session goes on. Since
+Claude Code v2.1.251 the status line input carries it directly, in a
+`prompt_cache` object with the tier and the moment the prefix goes cold; on
+older builds it is read from the transcript, where each response records which
+tier it wrote to. See [How it works](#how-it-works).
 
 ## Install
 
 Requires `jq` 1.5 or newer (`brew install jq` / `apt install jq`).
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/jamessqr/claude-cache-status/v1.2.0/claude-cache-status.sh \
+curl -fsSL https://raw.githubusercontent.com/jamessqr/claude-cache-status/v1.3.0/claude-cache-status.sh \
   -o ~/.claude/claude-cache-status.sh
 chmod +x ~/.claude/claude-cache-status.sh
 ```
@@ -97,7 +101,10 @@ substitute:
 **`refreshInterval` is required.** Status lines are event-driven: without it the
 countdown freezes while you sit at the prompt, which is exactly when you are
 looking at it. `30` suits the 1-hour tier. Use `1`–`5` if you want a live
-seconds readout — the warm path costs about 11 ms, so a 1 Hz refresh is safe.
+seconds readout — an idle render costs a few milliseconds, so a 1 Hz refresh is
+safe. Claude Code v2.1.251 and later also re-run the status line the moment the
+cache expires, so the flip to `cache cold` is prompt either way; the numbers
+before it still only move on the timer.
 
 The URL is pinned to a release tag, so the bytes you audit are the bytes you
 run. There is deliberately no `curl | sh` installer: this reads your session
@@ -145,7 +152,7 @@ rather than before.
 | `cache 6:30` (red) | Under 15% remaining |
 | `cache 42s` (red) | Final minute |
 | `cache cold` (red) | Expired — your next turn re-pays the write |
-| `cache ?` (grey) | Session is live but no cache write has been seen yet, so the tier is unknown |
+| `cache ?` (grey) | Session is live but no cache write has been seen, so the tier is unknown — or caching is off or unreported |
 | *(nothing)* | Not a Claude Code session, or no transcript available |
 
 With pricing enabled (below), each of those gains a figure: `cache 47m $6.65`.
@@ -166,7 +173,43 @@ means the same urgency on either.
 
 ## How it works
 
-Two values are needed: which tier, and when the last request started.
+Two values are needed: which tier, and when the clock started. There are two
+places to get them, tried in order.
+
+### From the status line input (Claude Code v2.1.251 and later)
+
+Claude Code now keeps a per-session ledger of the main conversation's cache
+activity and hands the status line a summary of it in a
+[`prompt_cache`](https://code.claude.com/docs/en/statusline#prompt-cache-fields)
+object. Two of its fields are exactly the two values above:
+
+| Field | Meaning |
+|---|---|
+| `ttl` | `"5m"` or `"1h"` — the tier of the current cached prefix |
+| `expires_at` | Epoch seconds when that prefix leaves its TTL and goes cold |
+
+Claude Code derives the tier from each response's `cache_creation` breakdown,
+the same evidence the transcript holds, and falls back to the TTL it asked for
+when a response wrote nothing — so a read-only turn never loses the tier. The
+ledger also sees things the transcript cannot: a `fork` subagent that reads the
+parent's prefix touches the parent's timer, and a compaction is marked so the
+next request's size is reported honestly as `recache_tokens_if_cold`. When
+`ttl` and `expires_at` are both present and well-formed they are used and the
+transcript is not opened. Anything missing or malformed — an older build, a
+gateway that strips cache tokens, a value that is not a number — falls through
+to the transcript. The countdown then agrees with the `warm`/`cold` word on
+`/usage`'s `Prompt cache (main)` line, because it is the same clock.
+
+`prompt_cache` excludes subagents and appears after the main conversation's
+first response. `caching_observed: false` means no response this session has
+carried cache tokens at all: caching is disabled, or the provider or gateway
+does not report it. There is nothing to count down, and the segment says
+`cache ?` rather than staying silent.
+
+### From the transcript (older builds)
+
+Before v2.1.251 the 1h/5m split appeared nowhere but the session transcript,
+and that path is kept as the fallback.
 
 **The tier** comes from the most recent response that wrote to cache, via
 `usage.cache_creation.ephemeral_1h_input_tokens` versus
@@ -191,7 +234,12 @@ nothing of theirs is in the main transcript to begin with; older builds
 interleaved subagent turns flagged `isSidechain`, and the filter for those
 stays in place.
 
-### Two behaviours that matter more than the detection itself
+The transcript is also read, on any build, when [pricing](#cost-at-risk-opt-in)
+is enabled: the inference-geography flag that sets the 1.1× multiplier is
+recorded only there. The tier and anchor still come from the status line input
+when it has them; only the multiplier is taken from the transcript.
+
+### Two behaviours of the transcript path that matter more than the detection itself
 
 **The tier is remembered per session.** A cache-read-only turn writes nothing, so
 the tier is momentarily invisible in the transcript. Rather than falling back to
@@ -222,6 +270,19 @@ long one**. A 700,000-token conversation on the 1-hour tier has $6.65 riding on
 it. The multiplier depends on the tier, which is why a tool that hardcodes one
 cannot get this right — hardcoding 1.25x understates a 1-hour session by 65%.
 
+One model family breaks the pattern. Claude Fable 5.1 and Mythos 5.1 bill cache
+reads at **0.025x** ($0.25/M against a $10 base) rather than 0.1x — and because
+the loss is the gap between the write and the read you would have made, a
+cheaper read makes expiry slightly *more* expensive there: (2 − 0.025) =
+**1.975x** on the hour tier, (1.25 − 0.025) = **1.225x** on the short one,
+$19.75/M and $12.25/M. Fable 5 keeps the standard read rate. The read rate is
+keyed on the model id, so it follows a hand-supplied base price too.
+
+The token count is `prompt_cache.recache_tokens_if_cold` when Claude Code
+supplies it — literally the tokens the next request re-caches if the cache is
+cold by then — and the context window's total input otherwise. The two agree to
+within a turn.
+
 Once the cache is cold the figure stays, because it is then no longer a risk: it
 is what your next message costs extra.
 
@@ -229,8 +290,10 @@ is what your next message costs extra.
 dollar figure would imply a cost you will never see. Nothing in the status line
 input reveals which billing you are on, so the opt-in is the signal.
 
-The price table covers Fable 5, Mythos 5, Opus 5 / 4.8 / 4.7 / 4.6 / 4.5,
-Sonnet 5 / 4.6 / 4.5 and Haiku 4.5 at list input rates. An unrecognised model
+The price table covers Fable 5.1 / 5, Mythos 5.1 / 5, Opus 5 / 4.8 / 4.7 /
+4.6 / 4.5, Sonnet 5 / 4.6 / 4.5 and Haiku 4.5 at list input rates. (Sonnet 5's
+$2 rate was announced as introductory; Anthropic made it the standard price in
+August 2026 and cancelled the September rise to $3.) An unrecognised model
 shows no figure rather than a guess. To price a model that is missing, or if
 your rates are not list rates — including rates an organisation has set through
 the `modelPricing` managed setting, which this script cannot see — give the
@@ -263,8 +326,12 @@ noise.
 
 ### Render cost
 
-The transcript is parsed only when it has changed, tracked by a small per-session
-state file keyed on the transcript's modification time and size. The mtime is
+On Claude Code v2.1.251 and later, without pricing, a render is one `jq` pass
+over stdin and nothing else: no file is opened, no state is written.
+
+When the transcript is needed it is parsed only when it has changed, tracked by
+a small per-session state file keyed on the transcript's modification time and
+size. The mtime is
 read at **fractional** precision deliberately: whole seconds cannot distinguish
 two writes in the same second that leave the file the same length, and stale
 state would then be served.
@@ -298,8 +365,8 @@ variants by default) and `DIM` (drawn as 50%-alpha faint text).
 
 The script is marked with two blocks, `---- COMPUTE ----` and
 `---- RENDER ----`. Copy both into your own script along with the `_esc`,
-`_is_int`, `_stat_token`, `_is_token`, `_is_geo` and `_price_cents_per_mtok`
-helpers and the `C_*` colours. COMPUTE
+`_is_int`, `_stat_token`, `_is_token`, `_is_geo`, `_price_cents_per_mtok` and
+`_read_permille` helpers and the `C_*` colours. COMPUTE
 goes after the line where you read stdin into `$input`; RENDER goes wherever the
 segment belongs.
 
@@ -320,10 +387,10 @@ short enough to audit in one sitting.
 
 | | |
 |---|---|
-| **Reads** | stdin JSON from Claude Code; the last 400 lines of the transcript it names; its own state file |
-| **Writes** | one state file per session under `$XDG_CACHE_HOME`, holding four integers. No conversation content. Pruned after 7 days |
+| **Reads** | stdin JSON from Claude Code. On builds older than v2.1.251, or when pricing is enabled: the last 400 lines of the transcript it names, and its own state file |
+| **Writes** | one state file per session under `$XDG_CACHE_HOME`, only when the transcript is read, holding four integers. No conversation content. Pruned after 7 days |
 | **Sends** | nothing. There are no network calls — `grep -E 'curl\|wget\|nc \|ssh' claude-cache-status.sh` comes back empty |
-| **Runs** | `jq`, `tail`, `stat`, `date`, `mkdir`, `mv`, `find`, `basename`, `tr`. No `eval`, no `sudo`, no constructed commands |
+| **Runs** | `jq`, `tail`, `stat`, `date`, `mkdir`, `mv`, `rm`, `find`, `basename`, `tr`. No `eval`, no `sudo`, no constructed commands |
 
 From the transcript it extracts two timestamps, two integer token counts and the
 inference-geography flag of one response. No message content, no prompts, no
@@ -335,6 +402,9 @@ Properties worth stating explicitly:
   so a `session_id` containing `../` cannot escape the state directory.
 - Control characters are stripped from JSON-sourced values, so a filename holding
   a real `ESC` byte cannot emit an escape sequence.
+- `prompt_cache` is normalised to an object before its fields are read, and its
+  numbers are accepted only as JSON numbers, so a malformed object cannot fail
+  the parse and take the transcript path down with it.
 - Every integer is validated before arithmetic, including values read back from
   the state file. Unvalidated shell arithmetic evaluates `"abc"` as `0` and
   overflows past 19 digits.
@@ -350,18 +420,24 @@ Properties worth stating explicitly:
 
 ## Limitations
 
-- **It depends on transcript fields that are not a documented contract** —
-  `.type`, `.timestamp`, `.isSidechain`, `.message.usage.cache_creation` and
-  `.message.usage.inference_geo`. The status line
-  *input* schema is documented and stable; the transcript JSONL shape is not,
-  and the docs [say so
+- **The fallback path depends on transcript fields that are not a documented
+  contract** — `.type`, `.timestamp`, `.isSidechain`,
+  `.message.usage.cache_creation` and `.message.usage.inference_geo`. The status
+  line *input* schema is documented and stable; the transcript JSONL shape is
+  not, and the docs [say so
   explicitly](https://code.claude.com/docs/en/sessions): the entry format is
-  internal and can change between versions. If a release renames those fields,
-  the segment vanishes silently and needs a fix. This is unavoidable for tier
-  detection: the 1h/5m split appears nowhere else — the status line's own JSON
-  gained aggregate cache counts (`context_window.current_usage.cache_*`), but
-  no tier. The state cache limits the exposure to roughly one transcript read
-  per turn rather than one per render.
+  internal and can change between versions. On Claude Code v2.1.251 and later
+  the tier and countdown come from the documented `prompt_cache` object and
+  this exposure shrinks to the 1.1× US-only multiplier, read from the
+  transcript only when pricing is on. On older builds it is unavoidable: the
+  1h/5m split appeared nowhere else, and if a release renames those fields the
+  segment vanishes silently and needs a fix.
+- **Turning fast mode on mid-conversation is an invisible miss.** The first
+  request with fast mode on adds a header that is part of the cache key, so it
+  re-reads the whole conversation uncached, at fast-mode rates. The countdown
+  still shows the old prefix as warm until that request lands. Turning fast mode
+  off, the cooldown fallback to standard speed, and turning it back on later all
+  keep the cache.
 - **With prompt caching disabled** (`DISABLE_PROMPT_CACHING` and its per-model
   variants), no cache write ever appears and the segment reads `cache ?`
   indefinitely — which is accurate, if unhelpful: there is no cache to time.
@@ -370,11 +446,13 @@ Properties worth stating explicitly:
 - **`/compact` destroys the prefix.** For the window between compaction and your
   next request, the countdown still refers to a prefix that no longer exists. It
   corrects itself on the following turn.
-- **A fork refreshes the cache invisibly.** A `fork` subagent inherits this
-  conversation's exact prefix, so its first request reads — and therefore
-  refreshes — this conversation's cache. Its transcript is a separate file, so
-  the countdown does not see that and can show less time than you actually have
-  while a fork is running. It corrects on your next turn.
+- **On older builds, a fork refreshes the cache invisibly.** A `fork` subagent
+  inherits this conversation's exact prefix, so its first request reads — and
+  therefore refreshes — this conversation's cache. Its transcript is a separate
+  file, so the transcript path does not see that and can show less time than
+  you actually have while a fork is running; it corrects on your next turn.
+  Claude Code's own ledger does account for it, so the `prompt_cache` path is
+  not affected.
 - **Timing is approximate.** The anchor is a proxy for request start, and the
   display only moves as often as `refreshInterval`.
 - **One input is unbounded.** A transcript consisting of a single enormous line
@@ -393,17 +471,22 @@ SH=dash sh tests/claude-cache-status.test.sh  # script under a named shell
 `SH` selects the shell the *script* is executed with, which is what the
 portability claim is about. It is independent of the shell running the harness.
 
-80 checks: tier detection on both tiers and on a mixed write, every display
-granularity boundary, all six colour bands, tier memory across a write-free
-window, subagent exclusion, `NO_COLOR`, corrupt state files and a pre-1.2.0
-three-field state file still honoured, path traversal via `session_id`,
-control-character stripping, nine malformed or hostile inputs verified to omit
-the segment without hanging, and every pricing path — each model in the table
-hand-checked against the arithmetic, fast mode on the two models that have it
-and on those that do not, US-only inference stacked with each price source and
-remembered across a write-free window, unknown models and garbage prices
-producing no figure, and a 1M-token context confirming the integer maths cannot
-overflow. Fixtures are generated at run time because every meaningful case is
+103 checks: the `prompt_cache` path on both tiers with no transcript present,
+expiry, clamping, precedence over a disagreeing transcript, no state file
+written, and five malformed shapes (unknown `ttl`, null or string `expires_at`,
+a non-object, absence) each falling back to the transcript; tier detection on
+both tiers and on a mixed write, every display granularity boundary, all six
+colour bands, tier memory across a write-free window, subagent exclusion,
+`NO_COLOR`, corrupt state files and a pre-1.2.0 three-field state file still
+honoured, path traversal via `session_id`, control-character stripping, nine
+malformed or hostile inputs verified to omit the segment without hanging, and
+every pricing path — each model in the table hand-checked against the
+arithmetic, the 0.025x read rate on Fable 5.1 and Mythos 5.1 alone, fast mode on
+the two models that have it and on those that do not, US-only inference stacked
+with each price source, remembered across a write-free window and still applied
+when the tier came from stdin, `recache_tokens_if_cold` preferred over the
+context total, unknown models and garbage prices producing no figure, and a
+1M-token context confirming the integer maths cannot overflow. Fixtures are generated at run time because every meaningful case is
 relative to the current time.
 
 CI runs the suite on every push across six combinations: `sh`, `dash` and `bash`
@@ -413,8 +496,14 @@ ships on macOS, which is where portability bugs in a script like this surface.
 
 ## Prior art
 
-Several projects address this, with different tradeoffs. Worth reading before
-choosing:
+Claude Code itself, from v2.1.251, shows a `Prompt cache (main)` line in
+`/usage` — request count, hit ratio, misses with a likely cause, and whether
+the cache is warm right now with its TTL — and exposes the same ledger to
+status lines as `prompt_cache`. This script is built on that where it exists,
+and adds the countdown, the colour bands and the cost figure on top.
+
+Several other projects address this, with different tradeoffs. Worth reading
+before choosing:
 
 - **[KatsuJinCode/claude-cache-countdown](https://github.com/KatsuJinCode/claude-cache-countdown)**
   — the most featured. A standalone Python ticker with escalating audible alerts,
@@ -445,9 +534,10 @@ choosing:
 
 This one detects the tier rather than taking it as configuration, remembers it
 across turns that write nothing, and reports it as unknown rather than guessed
-when it has never been seen; the countdown is anchored to request start rather
-than response end. The cost figure follows from the same detection, since the
-write multiplier differs by tier.
+when it has never been seen; on builds that expose it, the tier and expiry come
+straight from Claude Code's own ledger. The cost figure follows from the same
+detection, since the write multiplier differs by tier and the read rate by
+model.
 
 ## Licence
 

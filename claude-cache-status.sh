@@ -10,25 +10,37 @@
 #
 # The TTL tier is detected, never assumed: the API default is 5 minutes, the
 # 1-hour TTL is an opt-in at 2x the cache-write price, and Claude Code can drop
-# from 1h to 5m if a session enters usage overage. Each response records which
-# tier it wrote to under usage.cache_creation, and that is the only place the
-# split appears — the status line's own JSON carries aggregate token counts
-# only. Once established the tier is remembered for the session, so a turn that
-# only reads cache does not lose it. If it has never been established the
-# segment renders "cache ?" rather than guessing, because guessing 5m on a 1h
-# session reports "cold" with 55 minutes left.
+# from 1h to 5m if a session enters usage overage. Two sources, in order:
+#
+#   1. Claude Code 2.1.251 and later put a prompt_cache object in the status
+#      line's own stdin JSON, carrying the tier ("ttl": "5m" or "1h") and the
+#      moment the prefix goes cold ("expires_at", epoch seconds). Claude Code
+#      derives both from the cache token counts in each response, subagents
+#      excluded — the same evidence the transcript holds, one step closer to
+#      the source. When both are present and well-formed they are used and
+#      the transcript is not opened.
+#   2. Otherwise (older builds, or a degenerate prompt_cache) the transcript.
+#      Each response records which tier it wrote to under usage.cache_creation,
+#      and before 2.1.251 that was the only place the split appeared. Once
+#      established the tier is remembered for the session, so a turn that only
+#      reads cache does not lose it. If it has never been established the
+#      segment renders "cache ?" rather than guessing, because guessing 5m on
+#      a 1h session reports "cold" with 55 minutes left.
 #
 # WHAT THIS SCRIPT DOES AND DOES NOT DO
-#   Reads:   the JSON Claude Code sends on stdin; the tail of the session
-#            transcript named in that JSON; its own small state file.
+#   Reads:   the JSON Claude Code sends on stdin. The tail of the session
+#            transcript named in that JSON, and its own small state file, only
+#            on builds older than 2.1.251 or when pricing is enabled (the
+#            inference-geography flag is recorded nowhere else).
 #   Writes:  one state file per session under $XDG_CACHE_HOME (or ~/.cache),
-#            holding four integers — tier, anchor timestamp, a change token
-#            derived from the transcript's mtime and size, and a pricing
-#            multiplier. No conversation content. Files unused for 7 days are
-#            pruned. Nothing else is written anywhere.
+#            only when the transcript is read, holding four integers — tier,
+#            anchor timestamp, a change token derived from the transcript's
+#            mtime and size, and a pricing multiplier. No conversation content.
+#            Files unused for 7 days are pruned. Nothing else is written
+#            anywhere.
 #   Sends:   nothing. There are no network calls of any kind.
-#   Executes: jq, tail, stat, date, mkdir, mv, find, basename, tr. No eval, no
-#            sudo, no dynamic command construction.
+#   Executes: jq, tail, stat, date, mkdir, mv, rm, find, basename, tr. No eval,
+#            no sudo, no dynamic command construction.
 #   Extracts from the transcript: two timestamps, two integer token counts and
 #            the inference-geography flag of the last response. No message
 #            content, no prompts, no tool output. The only strings this script
@@ -43,6 +55,9 @@
 #
 #   refreshInterval IS REQUIRED. Status lines are otherwise event-driven, so the
 #   countdown would freeze at the prompt — exactly when you'd be looking at it.
+#   (Claude Code 2.1.251+ does re-run the status line the moment the cache
+#   expires, so the flip to "cold" is prompt either way; the numbers before it
+#   still only move on the timer.)
 #
 #   To merge into an existing status line, copy the marked COMPUTE and RENDER
 #   blocks plus the helpers and colours they reference. If your script uses
@@ -143,6 +158,9 @@ _is_token() {
 # double the standard rate — and the cache multipliers stack on top of it, so a
 # fast-mode session that is priced at the standard rate shows half the real
 # figure. Only those two models have fast mode; the flag is ignored elsewhere.
+#
+# Sonnet 5's $2 rate was announced as introductory; Anthropic made it the
+# standard price in August 2026 and cancelled the September rise to $3.
 _price_cents_per_mtok() {
   case "$1" in
     *fable-5* | *mythos-5*) echo 1000 ;;
@@ -152,6 +170,20 @@ _price_cents_per_mtok() {
     *sonnet-4-6* | *sonnet-4-5*) echo 300 ;;
     *haiku-4-5*) echo 100 ;;
     *) echo "" ;;
+  esac
+}
+
+# Cache-READ price as a per-mille fraction of the base input price. Every model
+# bills reads at 0.1x (100) except Claude Fable 5.1 and Mythos 5.1, where a
+# read is 0.025x (25): $0.25/Mtok against a $10 base. Counter-intuitively that
+# makes expiry slightly MORE expensive there, not less — the loss is the gap
+# between the write you now pay and the read you would have paid, and the read
+# just got cheaper. Keyed on the model id, so it applies to a hand-supplied
+# base price too: the read discount is a property of the model, not the rate.
+_read_permille() {
+  case "$1" in
+    *fable-5-1* | *mythos-5-1*) echo 25 ;;
+    *) echo 100 ;;
   esac
 }
 
@@ -180,16 +212,26 @@ _is_geo() {
 # state directory. Control characters are stripped from the transcript path so
 # nothing downstream can emit a raw escape sequence.
 #
+# prompt_cache is normalised to an object first, so a build that sends
+# something else there cannot fail the whole parse and take the transcript
+# path down with it. Its numeric fields are accepted only as JSON numbers and
+# floored: a string that merely looks like a number is not an epoch.
+#
 # [[:cntrl:]] is a POSIX class Oniguruma understands. Do NOT write it as
 # "[\\u0000-\\u001f]": inside a jq string literal that is a literal backslash
 # followed by "u0000", which becomes a class of the letters u/0/1/f and quietly
 # corrupts ordinary values ("Opus" -> "ps", "/tmp/x" -> "//x").
 ccs_fields=$(printf '%s' "$input" | jq -r '
-    ((.session_id // "") | tostring | gsub("[^A-Za-z0-9_-]"; "") | .[0:64]),
-    ((.transcript_path // "") | tostring | gsub("[[:cntrl:]]"; "")),
-    ((.model.id // .model.display_name // "") | tostring | gsub("[^A-Za-z0-9._-]"; "")),
-    ((.context_window.total_input_tokens // "") | tostring),
-    ((.fast_mode // false) | tostring | gsub("[^a-z]"; ""))
+    (.prompt_cache | if type == "object" then . else {} end) as $pc
+    | ((.session_id // "") | tostring | gsub("[^A-Za-z0-9_-]"; "") | .[0:64]),
+      ((.transcript_path // "") | tostring | gsub("[[:cntrl:]]"; "")),
+      ((.model.id // .model.display_name // "") | tostring | gsub("[^A-Za-z0-9._-]"; "")),
+      ((.context_window.total_input_tokens // "") | tostring),
+      ((.fast_mode // false) | tostring | gsub("[^a-z]"; "")),
+      (($pc.ttl // "") | tostring | gsub("[^0-9a-z]"; "")),
+      ($pc.expires_at | if type == "number" then floor | tostring else "" end),
+      ($pc.caching_observed | if type == "boolean" then tostring else "" end),
+      ($pc.recache_tokens_if_cold | if type == "number" then floor | tostring else "" end)
   ' 2>/dev/null)
 {
   IFS= read -r ccs_session
@@ -197,6 +239,10 @@ ccs_fields=$(printf '%s' "$input" | jq -r '
   IFS= read -r ccs_model
   IFS= read -r ccs_ctx_tokens
   IFS= read -r ccs_fast
+  IFS= read -r ccs_pc_ttl
+  IFS= read -r ccs_pc_expires
+  IFS= read -r ccs_pc_observed
+  IFS= read -r ccs_pc_tokens
 } <<EOF
 $ccs_fields
 EOF
@@ -212,11 +258,48 @@ cache_left=""
 cache_state=""   # "" = nothing to show, "unknown" = session known, tier not
 cache_cents=""   # cost at risk in whole cents, only when pricing is opted in
 
+ccs_now=$(date +%s)
+ccs_tier=""      # TTL in seconds: 300 or 3600
+ccs_anchor=""    # epoch of the request start the TTL counts from
+ccs_geo=""       # 100 or 110, see _is_geo
+
+# --- source 1: prompt_cache on stdin (Claude Code >= 2.1.251) --------------
+# The anchor is back-derived from expires_at so that everything below — the
+# remaining-time arithmetic, the clamp, the colour bands — is one code path
+# for both sources. Anything missing or malformed leaves ccs_pc_anchor empty
+# and the transcript decides, exactly as before 2.1.251.
+ccs_pc_tier=""
+ccs_pc_anchor=""
+case "$ccs_pc_ttl" in
+  5m) ccs_pc_tier=300 ;;
+  1h) ccs_pc_tier=3600 ;;
+esac
+if [ -n "$ccs_pc_tier" ] && _is_int "$ccs_pc_expires" && [ "$ccs_pc_expires" -gt 0 ]; then
+  ccs_pc_anchor=$(( ccs_pc_expires - ccs_pc_tier ))
+fi
+
+# The transcript is opened when stdin did not settle the tier, and — whatever
+# stdin said — when pricing is on, because the inference-geography flag that
+# sets the 1.1x multiplier is recorded only in the transcript. When neither
+# applies the transcript is never touched and no state file is written.
+#
+# caching_observed:false is Claude Code reporting that no response this
+# session has carried cache tokens: caching is disabled, or the provider or
+# gateway does not report it. The transcript can hold nothing more, and there
+# is no honest countdown, so the segment says so rather than staying silent.
+ccs_need_transcript=""
+[ -z "$ccs_pc_anchor" ] && ccs_need_transcript=1
+[ -n "${CLAUDE_CACHE_STATUS_PRICING:-}" ] && ccs_need_transcript=1
+if [ -z "$ccs_pc_anchor" ] && [ "$ccs_pc_observed" = false ]; then
+  cache_state="unknown"
+  ccs_need_transcript=""
+fi
+
+# --- source 2: the transcript ----------------------------------------------
 # -f is true only for regular files, so a fifo, device, or directory supplied
 # as transcript_path short-circuits here and `tail` can never block.
-if [ -n "$ccs_transcript" ] && [ -f "$ccs_transcript" ] && [ -n "$ccs_session" ]; then
+if [ -n "$ccs_need_transcript" ] && [ -n "$ccs_transcript" ] && [ -f "$ccs_transcript" ] && [ -n "$ccs_session" ]; then
 
-  ccs_now=$(date +%s)
   ccs_token=$(_stat_token "$ccs_transcript")
   _is_token "$ccs_token" || ccs_token=""
 
@@ -232,9 +315,6 @@ if [ -n "$ccs_transcript" ] && [ -f "$ccs_transcript" ] && [ -n "$ccs_session" ]
   # refreshInterval re-runs this script repeatedly while the session sits idle.
   # The fourth field was added in v1.2.0; a three-field file from an earlier
   # release is still accepted and read as the standard (100) multiplier.
-  ccs_tier=""
-  ccs_anchor=""
-  ccs_geo=""
   if [ -f "$ccs_state" ] && [ -n "$ccs_token" ]; then
     IFS=' ' read -r s_tier s_anchor s_token s_geo < "$ccs_state" 2>/dev/null
     [ -z "$s_geo" ] && s_geo=100
@@ -269,10 +349,11 @@ if [ -n "$ccs_transcript" ] && [ -f "$ccs_transcript" ] && [ -n "$ccs_session" ]
     # corrupt tier detection.
     #
     # 400 lines rather than 200: Claude Code now interleaves several small
-    # bookkeeping entries per turn (permission-mode, mode, last-prompt,
-    # ai-title, attachment ...), so the same number of lines covers fewer
-    # turns than it used to. The window is only a cost bound; the remembered
-    # tier covers any write-free stretch that exceeds it.
+    # bookkeeping entries per turn (attachment, permission-mode, mode,
+    # last-prompt, ai-title, bridge-session, atis-latch ...), so the same
+    # number of lines covers fewer turns than it used to. The window is only a
+    # cost bound; the remembered tier covers any write-free stretch that
+    # exceeds it.
     ccs_raw=$(tail -n 400 "$ccs_transcript" 2>/dev/null | jq -rs '
       def epoch: sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601;
       [ .[] | select(.isSidechain != true) ] as $main
@@ -341,60 +422,84 @@ EOF
       fi
     fi
   fi
+fi
 
-  # --- remaining ------------------------------------------------------------
-  if _is_int "$ccs_tier" && _is_int "$ccs_anchor" && [ "$ccs_tier" -gt 0 ] && _is_int "$ccs_now"; then
-    cache_ttl="$ccs_tier"
-    cache_left=$(( ccs_tier - (ccs_now - ccs_anchor) ))
+# --- merge: stdin settles tier and anchor when it can ----------------------
+# The transcript may still have run above, for the geography or because an
+# older state file existed; stdin's figures are the more direct evidence and
+# take precedence. Only the multiplier is kept from the transcript.
+if [ -n "$ccs_pc_anchor" ]; then
+  ccs_tier="$ccs_pc_tier"
+  ccs_anchor="$ccs_pc_anchor"
+fi
+_is_geo "${ccs_geo:-}" || ccs_geo=100
 
-    # ---- cost at risk (opt-in) ------------------------------------------
-    # What expiry costs: you write the prefix again instead of reading it.
-    # Cache pricing is a multiple of the normal input price — reads 0.1x,
-    # 5-minute writes 1.25x, 1-hour writes 2x — so the loss is the gap:
-    #   5m tier: 1.25 - 0.1 = 1.15x     1h tier: 2.0 - 0.1 = 1.9x
-    # At Opus's $5/Mtok that is $5.75/Mtok on the short tier and $9.50 on the
-    # long one. The multiplier depends on the tier, which is why this is worth
-    # doing here and hard to do without tier detection.
-    #
-    # Opt-in, because on a Pro or Max subscription you are not billed per token
-    # and the figure would imply a cost you will never see. Nothing in the
-    # status line input says which billing you are on, so the opt-in IS the
-    # signal. All arithmetic is integer cents; no shell float rounding.
-    #
-    # Two modifiers stack on the base price. Fast mode (Opus 5 / 4.8, from the
-    # fast_mode flag on stdin) doubles the input rate; it is applied only to
-    # the built-in table, because a hand-supplied price is taken as given.
-    # US-only inference (from the transcript, remembered with the tier) is a
-    # flat 1.1x on everything, so it applies to either.
-    if [ -n "${CLAUDE_CACHE_STATUS_PRICING:-}" ] && _is_int "$ccs_ctx_tokens" &&
-       [ "$ccs_ctx_tokens" -gt 0 ]; then
-      case "$CLAUDE_CACHE_STATUS_PRICING" in
-        api) ccs_price=$(_price_cents_per_mtok "$ccs_model" "$ccs_fast") ;;
-        *.*) # dollars per million, one or two decimal places
-          ccs_p_whole=${CLAUDE_CACHE_STATUS_PRICING%%.*}
-          ccs_p_frac=${CLAUDE_CACHE_STATUS_PRICING#*.}00
-          _is_int "$ccs_p_whole" && _is_int "${ccs_p_frac%"${ccs_p_frac#??}"}" &&
-            ccs_price=$(( ccs_p_whole * 100 + ${ccs_p_frac%"${ccs_p_frac#??}"} )) ;;
-        *) _is_int "$CLAUDE_CACHE_STATUS_PRICING" &&
-             ccs_price=$(( CLAUDE_CACHE_STATUS_PRICING * 100 )) ;;
-      esac
+# --- remaining --------------------------------------------------------------
+if _is_int "$ccs_tier" && _is_int "$ccs_anchor" && [ "$ccs_tier" -gt 0 ] && _is_int "$ccs_now"; then
+  cache_ttl="$ccs_tier"
+  cache_left=$(( ccs_tier - (ccs_now - ccs_anchor) ))
+  cache_state=""
 
-      if _is_int "${ccs_price:-}" && [ "$ccs_price" -gt 0 ]; then
-        # 190 = 1.9x for the 1h tier, 115 = 1.15x for the 5m tier
-        if [ "$ccs_tier" -ge 3600 ]; then ccs_mult=190; else ccs_mult=115; fi
-        # Divide the token count first so the product cannot overflow a 32-bit
-        # shell: (tokens/1000) * cents_per_mtok / 1000 == tokens * cents / 1e6
-        _is_geo "${ccs_geo:-}" || ccs_geo=100
-        ccs_loss=$(( ccs_price * ccs_mult / 100 * ccs_geo / 100 ))
-        cache_cents=$(( (ccs_ctx_tokens / 1000) * ccs_loss / 1000 ))
-      fi
-    fi
-
-  elif _is_int "$ccs_anchor"; then
-    # The session is real and we know when it last spoke, but no cache write has
-    # been seen, so the tier is unknown. Distinct from "not a Claude session".
-    cache_state="unknown"
+  # ---- cost at risk (opt-in) --------------------------------------------
+  # What expiry costs: you write the prefix again instead of reading it.
+  # Cache pricing is a multiple of the normal input price — reads 0.1x (0.025x
+  # on Fable 5.1 / Mythos 5.1), 5-minute writes 1.25x, 1-hour writes 2x — so
+  # the loss is the gap:
+  #   5m tier: 1.25 - 0.1 = 1.15x     1h tier: 2.0 - 0.1 = 1.9x
+  # At Opus's $5/Mtok that is $5.75/Mtok on the short tier and $9.50 on the
+  # long one. The multiplier depends on the tier, which is why this is worth
+  # doing here and hard to do without tier detection.
+  #
+  # Opt-in, because on a Pro or Max subscription you are not billed per token
+  # and the figure would imply a cost you will never see. Nothing in the
+  # status line input says which billing you are on, so the opt-in IS the
+  # signal. All arithmetic is integer cents; no shell float rounding.
+  #
+  # The token count is prompt_cache.recache_tokens_if_cold when Claude Code
+  # supplies it — literally "tokens the next request re-caches if the cache
+  # has gone cold by then" — and the context window's total input otherwise.
+  # The two agree to within a turn; the first is null for the one request
+  # after a compaction, when the second is the right answer anyway.
+  #
+  # Two modifiers stack on the base price. Fast mode (Opus 5 / 4.8, from the
+  # fast_mode flag on stdin) doubles the input rate; it is applied only to
+  # the built-in table, because a hand-supplied price is taken as given.
+  # US-only inference (from the transcript, remembered with the tier) is a
+  # flat 1.1x on everything, so it applies to either.
+  ccs_tokens="$ccs_ctx_tokens"
+  if _is_int "$ccs_pc_tokens" && [ "$ccs_pc_tokens" -gt 0 ]; then
+    ccs_tokens="$ccs_pc_tokens"
   fi
+  if [ -n "${CLAUDE_CACHE_STATUS_PRICING:-}" ] && _is_int "$ccs_tokens" &&
+     [ "$ccs_tokens" -gt 0 ]; then
+    case "$CLAUDE_CACHE_STATUS_PRICING" in
+      api) ccs_price=$(_price_cents_per_mtok "$ccs_model" "$ccs_fast") ;;
+      *.*) # dollars per million, one or two decimal places
+        ccs_p_whole=${CLAUDE_CACHE_STATUS_PRICING%%.*}
+        ccs_p_frac=${CLAUDE_CACHE_STATUS_PRICING#*.}00
+        _is_int "$ccs_p_whole" && _is_int "${ccs_p_frac%"${ccs_p_frac#??}"}" &&
+          ccs_price=$(( ccs_p_whole * 100 + ${ccs_p_frac%"${ccs_p_frac#??}"} )) ;;
+      *) _is_int "$CLAUDE_CACHE_STATUS_PRICING" &&
+           ccs_price=$(( CLAUDE_CACHE_STATUS_PRICING * 100 )) ;;
+    esac
+
+    if _is_int "${ccs_price:-}" && [ "$ccs_price" -gt 0 ]; then
+      # Per-mille multipliers: write 2000 (1h) or 1250 (5m), read 100 or 25.
+      # Loss = write - read: 1900 / 1150 on most models, 1975 / 1225 on
+      # Fable 5.1 and Mythos 5.1.
+      if [ "$ccs_tier" -ge 3600 ]; then ccs_write=2000; else ccs_write=1250; fi
+      ccs_mult=$(( ccs_write - $(_read_permille "$ccs_model") ))
+      # Divide the token count first so the product cannot overflow a 32-bit
+      # shell: (tokens/1000) * cents_per_mtok / 1000 == tokens * cents / 1e6
+      ccs_loss=$(( ccs_price * ccs_mult / 1000 * ccs_geo / 100 ))
+      cache_cents=$(( (ccs_tokens / 1000) * ccs_loss / 1000 ))
+    fi
+  fi
+
+elif _is_int "$ccs_anchor"; then
+  # The session is real and we know when it last spoke, but no cache write has
+  # been seen, so the tier is unknown. Distinct from "not a Claude session".
+  cache_state="unknown"
 fi
 # ---- end COMPUTE ----------------------------------------------------------
 
