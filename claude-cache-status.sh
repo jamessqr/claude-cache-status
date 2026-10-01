@@ -44,9 +44,10 @@
 #   Extracts from the transcript: two timestamps, two integer token counts and
 #            the inference-geography flag of the last response. No message
 #            content, no prompts, no tool output. The only strings this script
-#            can print are "cache <value>", "cache cold" and "cache ?", each
-#            optionally followed by a dollar figure when
-#            CLAUDE_CACHE_STATUS_PRICING is set.
+#            can print are "cache <value>", "cache cold" and "cache ?", the
+#            first two optionally followed by a dollar figure when
+#            CLAUDE_CACHE_STATUS_PRICING is set, and "cache cold" otherwise
+#            by a token count such as "412k".
 #
 # INSTALL
 #   "statusLine": { "type": "command",
@@ -154,19 +155,23 @@ _is_token() {
 # model that is missing, or when your rates are not list rates.
 #
 # $2 is the session's fast_mode flag from the status line input. Fast mode is a
-# different price for the same model — $10/Mtok input on Opus 5 and Opus 4.8,
-# double the standard rate — and the cache multipliers stack on top of it, so a
-# fast-mode session that is priced at the standard rate shows half the real
-# figure. Only those two models have fast mode; the flag is ignored elsewhere.
+# different price for the same model — double the standard input rate: $8/Mtok
+# on Opus 5.5, $10 on Opus 5 and Opus 4.8 — and the cache multipliers stack on
+# top of it, so a fast-mode session that is priced at the standard rate shows
+# half the real figure. Only those three models have fast mode; the flag is
+# ignored elsewhere.
 #
-# Sonnet 5's $2 rate was announced as introductory; Anthropic made it the
-# standard price in August 2026 and cancelled the September rise to $3.
+# Opus 5.5 must be matched before the *opus-5* glob, which it would otherwise
+# fall into: it is $4/Mtok, not Opus 5's $5. Sonnet 5.5 shares Sonnet 5's $2,
+# which was announced as introductory; Anthropic made it the standard price in
+# August 2026 and cancelled the September rise to $3.
 _price_cents_per_mtok() {
   case "$1" in
     *fable-5* | *mythos-5*) echo 1000 ;;
+    *opus-5-5*) if [ "${2:-}" = true ]; then echo 800; else echo 400; fi ;;
     *opus-5* | *opus-4-8*) if [ "${2:-}" = true ]; then echo 1000; else echo 500; fi ;;
     *opus-4-7* | *opus-4-6* | *opus-4-5*) echo 500 ;;
-    *sonnet-5*) echo 200 ;;
+    *sonnet-5-5* | *sonnet-5*) echo 200 ;;
     *sonnet-4-6* | *sonnet-4-5*) echo 300 ;;
     *haiku-4-5*) echo 100 ;;
     *) echo "" ;;
@@ -174,15 +179,17 @@ _price_cents_per_mtok() {
 }
 
 # Cache-READ price as a per-mille fraction of the base input price. Every model
-# bills reads at 0.1x (100) except Claude Fable 5.1 and Mythos 5.1, where a
-# read is 0.025x (25): $0.25/Mtok against a $10 base. Counter-intuitively that
-# makes expiry slightly MORE expensive there, not less — the loss is the gap
-# between the write you now pay and the read you would have paid, and the read
-# just got cheaper. Keyed on the model id, so it applies to a hand-supplied
-# base price too: the read discount is a property of the model, not the rate.
+# bills reads at 0.1x (100) except two: Claude Fable 5.1 and Mythos 5.1 read at
+# 0.025x (25), $0.25/Mtok against a $10 base, and Opus 5.5 at 0.05x (50),
+# $0.20/Mtok against $4. Counter-intuitively that makes expiry slightly MORE
+# expensive there, not less — the loss is the gap between the write you now
+# pay and the read you would have paid, and the read just got cheaper. Keyed
+# on the model id, so it applies to a hand-supplied base price too: the read
+# discount is a property of the model, not the rate.
 _read_permille() {
   case "$1" in
     *fable-5-1* | *mythos-5-1*) echo 25 ;;
+    *opus-5-5*) echo 50 ;;
     *) echo 100 ;;
   esac
 }
@@ -200,7 +207,7 @@ _is_geo() {
 
 # ---------------------------------------------------------------------------
 # COMPUTE  (needs $input; sets $cache_ttl, $cache_left, $cache_state,
-#           and $cache_cents when pricing is opted in)
+#           $cache_tokens, and $cache_cents when pricing is opted in)
 # ---------------------------------------------------------------------------
 #
 # One jq pass. printf '%s' rather than echo: echo mangles backslash escapes in
@@ -231,7 +238,11 @@ ccs_fields=$(printf '%s' "$input" | jq -r '
       (($pc.ttl // "") | tostring | gsub("[^0-9a-z]"; "")),
       ($pc.expires_at | if type == "number" then floor | tostring else "" end),
       ($pc.caching_observed | if type == "boolean" then tostring else "" end),
-      ($pc.recache_tokens_if_cold | if type == "number" then floor | tostring else "" end)
+      ($pc.recache_tokens_if_cold
+         | if type == "number" then floor | tostring
+           elif ($pc | has("recache_tokens_if_cold")) then "null"
+           else "" end),
+      ($pc.warm | if type == "boolean" then tostring else "" end)
   ' 2>/dev/null)
 {
   IFS= read -r ccs_session
@@ -243,6 +254,7 @@ ccs_fields=$(printf '%s' "$input" | jq -r '
   IFS= read -r ccs_pc_expires
   IFS= read -r ccs_pc_observed
   IFS= read -r ccs_pc_tokens
+  IFS= read -r ccs_pc_warm
 } <<EOF
 $ccs_fields
 EOF
@@ -257,6 +269,7 @@ cache_ttl=""
 cache_left=""
 cache_state=""   # "" = nothing to show, "unknown" = session known, tier not
 cache_cents=""   # cost at risk in whole cents, only when pricing is opted in
+cache_tokens=""  # tokens the next request re-caches if the prefix is cold
 
 ccs_now=$(date +%s)
 ccs_tier=""      # TTL in seconds: 300 or 3600
@@ -276,6 +289,33 @@ case "$ccs_pc_ttl" in
 esac
 if [ -n "$ccs_pc_tier" ] && _is_int "$ccs_pc_expires" && [ "$ccs_pc_expires" -gt 0 ]; then
   ccs_pc_anchor=$(( ccs_pc_expires - ccs_pc_tier ))
+fi
+
+# Two states in which Claude Code knows the prefix is not warm while the
+# numbers above would still show a countdown — or, with expires_at null,
+# would fall through to a transcript that does not know:
+#
+#   - warm:false with expires_at null. The last response carried no cache
+#     tokens at all, so nothing was read or refreshed. The transcript would
+#     find an older write and count down from it.
+#   - recache_tokens_if_cold present and null. Claude Code has just rewritten
+#     the conversation (a compaction, or a clearing of old tool results) and
+#     the cache does not cover the new one yet; expires_at still describes the
+#     prefix that was replaced. The VS Code extension's own cache clock shows
+#     cold here for the same reason.
+#
+# Both are reported as cold by placing the anchor exactly one TTL in the past,
+# so the remaining-time path below is unchanged. The second also withholds
+# the cost figure: the rewritten conversation's size is not known yet, and
+# the context-window total still describes the old one.
+ccs_pc_rebuild=""
+if [ -n "$ccs_pc_tier" ] && [ "$ccs_pc_observed" != false ]; then
+  if [ "$ccs_pc_tokens" = null ]; then
+    ccs_pc_rebuild=1
+  fi
+  if [ -n "$ccs_pc_rebuild" ] || { [ "$ccs_pc_warm" = false ] && [ -z "$ccs_pc_anchor" ]; }; then
+    ccs_pc_anchor=$(( ccs_now - ccs_pc_tier ))
+  fi
 fi
 
 # The transcript is opened when stdin did not settle the tier, and — whatever
@@ -457,9 +497,10 @@ if _is_int "$ccs_tier" && _is_int "$ccs_anchor" && [ "$ccs_tier" -gt 0 ] && _is_
   #
   # The token count is prompt_cache.recache_tokens_if_cold when Claude Code
   # supplies it — literally "tokens the next request re-caches if the cache
-  # has gone cold by then" — and the context window's total input otherwise.
-  # The two agree to within a turn; the first is null for the one request
-  # after a compaction, when the second is the right answer anyway.
+  # has gone cold by then" — and the context window's total input otherwise
+  # (builds before 2.1.251). The two agree to within a turn. Right after a
+  # compaction the first is null and the second may still describe the old
+  # conversation, so no count is used at all; see ccs_pc_rebuild above.
   #
   # Two modifiers stack on the base price. Fast mode (Opus 5 / 4.8, from the
   # fast_mode flag on stdin) doubles the input rate; it is applied only to
@@ -470,6 +511,8 @@ if _is_int "$ccs_tier" && _is_int "$ccs_anchor" && [ "$ccs_tier" -gt 0 ] && _is_
   if _is_int "$ccs_pc_tokens" && [ "$ccs_pc_tokens" -gt 0 ]; then
     ccs_tokens="$ccs_pc_tokens"
   fi
+  [ -n "$ccs_pc_rebuild" ] && ccs_tokens=""
+  _is_int "$ccs_tokens" && [ "$ccs_tokens" -gt 0 ] && cache_tokens="$ccs_tokens"
   if [ -n "${CLAUDE_CACHE_STATUS_PRICING:-}" ] && _is_int "$ccs_tokens" &&
      [ "$ccs_tokens" -gt 0 ]; then
     case "$CLAUDE_CACHE_STATUS_PRICING" in
@@ -506,7 +549,8 @@ fi
 line=""
 
 # ---------------------------------------------------------------------------
-# RENDER  (needs $cache_ttl, $cache_left, $cache_state, the C_* colours)
+# RENDER  (needs $cache_ttl, $cache_left, $cache_state, $cache_tokens,
+#          $cache_cents, the C_* colours)
 # ---------------------------------------------------------------------------
 if [ "$cache_state" = "unknown" ]; then
   # An anchor exists but no cache write has been seen, so the tier is unknown
@@ -555,6 +599,21 @@ elif [ -n "$cache_left" ] && [ -n "$cache_ttl" ]; then
   # session the figure is pennies and reads as noise.
   if _is_int "${cache_cents:-}" && [ "$cache_cents" -ge 10 ]; then
     cache_text="$cache_text \$$(( cache_cents / 100 )).$(printf '%02d' "$(( cache_cents % 100 ))")"
+
+  # Unpriced and cold: the size of the re-write instead, "cache cold 412k".
+  # It is the number Claude Code's own "/clear to save 412k tokens" nudge
+  # shows on return, and on a subscription it is the meaningful one — it is
+  # what the next message draws from plan usage at the uncached rate. Only
+  # when cold: while warm it is the context size, which most status lines
+  # already show. Under 1k it is noise.
+  elif [ -z "${CLAUDE_CACHE_STATUS_PRICING:-}" ] && [ "$cache_left" -le 0 ] &&
+       _is_int "${cache_tokens:-}" && [ "$cache_tokens" -ge 1000 ]; then
+    if [ "$cache_tokens" -ge 999500 ]; then   # else "1000k"
+      cache_tok_c=$(( (cache_tokens + 50000) / 100000 ))   # tenths of a million
+      cache_text="$cache_text $(( cache_tok_c / 10 )).$(( cache_tok_c % 10 ))M"
+    else
+      cache_text="$cache_text $(( (cache_tokens + 500) / 1000 ))k"
+    fi
   fi
 
   line="${cache_color}${cache_text}${C_RESET}"

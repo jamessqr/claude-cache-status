@@ -20,9 +20,14 @@ for free every time you use it. Walk away for long enough and it expires — you
 next message silently re-pays the full write price on the entire conversation.
 On a large session that is the most expensive request you will make all day.
 
-Claude Code's `/usage` will tell you whether the cache is warm right now.
-Nothing tells you how long you have left, or what it costs if you miss. This
-does.
+Claude Code tells you some of this, after the fact. `/usage` says whether the
+cache is warm right now. Come back to a stale session in the terminal and a
+footer nudge offers `/clear to save 412k tokens`: that is the size of what your
+next message re-sends uncached, but it appears on a fixed 75-minute idle timer
+rather than when your cache actually expires, which on the 5-minute tier is
+seventy minutes earlier. The VS Code extension has a cache clock beside its
+context indicator; the terminal has nothing that counts down. Nothing tells you
+how long you have left before you leave, or what missing it costs. This does.
 
 ## Two cache lifetimes
 
@@ -80,7 +85,7 @@ tier it wrote to. See [How it works](#how-it-works).
 Requires `jq` 1.5 or newer (`brew install jq` / `apt install jq`).
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/jamessqr/claude-cache-status/v1.3.0/claude-cache-status.sh \
+curl -fsSL https://raw.githubusercontent.com/jamessqr/claude-cache-status/v1.4.0/claude-cache-status.sh \
   -o ~/.claude/claude-cache-status.sh
 chmod +x ~/.claude/claude-cache-status.sh
 ```
@@ -151,11 +156,19 @@ rather than before.
 | `cache 22m` (amber) | 15–50% remaining |
 | `cache 6:30` (red) | Under 15% remaining |
 | `cache 42s` (red) | Final minute |
-| `cache cold` (red) | Expired — your next turn re-pays the write |
+| `cache cold 412k` (red) | Expired — your next turn re-pays the write on 412k tokens |
 | `cache ?` (grey) | Session is live but no cache write has been seen, so the tier is unknown — or caching is off or unreported |
 | *(nothing)* | Not a Claude Code session, or no transcript available |
 
-With pricing enabled (below), each of those gains a figure: `cache 47m $6.65`.
+The token count on `cache cold` is the same number Claude Code's
+`/clear to save …` nudge shows, and the one that matters on a subscription:
+what your next message draws from plan usage at the uncached rate, and roughly
+what `/clear` or `/compact` would avoid. It is shown only once the cache is
+cold — while warm it is just your context size, which your status line
+probably already shows — and not under 1k.
+
+With pricing enabled (below), every countdown and `cache cold` carry a dollar
+figure instead: `cache 47m $6.65`.
 
 Two deliberate choices there.
 
@@ -205,6 +218,19 @@ first response. `caching_observed: false` means no response this session has
 carried cache tokens at all: caching is disabled, or the provider or gateway
 does not report it. There is nothing to count down, and the segment says
 `cache ?` rather than staying silent.
+
+Two other states read as `cache cold` even though `expires_at` alone would
+not say so:
+
+- **Just compacted.** `recache_tokens_if_cold` is `null` right after a
+  compaction or a clearing of old tool results, until the next request records
+  the rewritten conversation's size. The cache does not cover the new
+  conversation yet, and `expires_at` still describes the prefix that was
+  replaced. No figure is shown, because nothing yet knows the new size. The
+  VS Code extension's cache clock goes red here for the same reason.
+- **The last response carried no cache tokens.** `warm` is `false` and
+  `expires_at` is `null`: nothing was read or refreshed. Falling back to the
+  transcript here would find an older write and count down from it.
 
 ### From the transcript (older builds)
 
@@ -265,23 +291,30 @@ write instead of read, so the loss is the gap between them:
 | 5-minute | (1.25 − 0.1) = **1.15x** input price |
 | 1-hour | (2 − 0.1) = **1.9x** input price |
 
-At Opus's $5 per million that is $5.75/M on the short tier and **$9.50/M on the
-long one**. A 700,000-token conversation on the 1-hour tier has $6.65 riding on
-it. The multiplier depends on the tier, which is why a tool that hardcodes one
-cannot get this right — hardcoding 1.25x understates a 1-hour session by 65%.
+At Opus 5's $5 per million that is $5.75/M on the short tier and **$9.50/M on
+the long one**. A 700,000-token conversation on the 1-hour tier has $6.65
+riding on it. The multiplier depends on the tier, which is why a tool that
+hardcodes one cannot get this right — hardcoding 1.25x understates a 1-hour
+session by 65%.
 
-One model family breaks the pattern. Claude Fable 5.1 and Mythos 5.1 bill cache
-reads at **0.025x** ($0.25/M against a $10 base) rather than 0.1x — and because
-the loss is the gap between the write and the read you would have made, a
-cheaper read makes expiry slightly *more* expensive there: (2 − 0.025) =
-**1.975x** on the hour tier, (1.25 − 0.025) = **1.225x** on the short one,
-$19.75/M and $12.25/M. Fable 5 keeps the standard read rate. The read rate is
-keyed on the model id, so it follows a hand-supplied base price too.
+Three models break the pattern with cheaper reads — and because the loss is
+the gap between the write and the read you would have made, a cheaper read
+makes expiry slightly *more* expensive, not less:
+
+| Model | Read rate | Loss, 1-hour | Loss, 5-minute |
+|---|---|---|---|
+| Fable 5.1, Mythos 5.1 ($10) | 0.025x | 1.975x = $19.75/M | 1.225x = $12.25/M |
+| Opus 5.5 ($4) | 0.05x | 1.95x = $7.80/M | 1.20x = $4.80/M |
+
+Fable 5 and Mythos 5 keep the standard read rate. The read rate is keyed on the
+model id, so it follows a hand-supplied base price too.
 
 The token count is `prompt_cache.recache_tokens_if_cold` when Claude Code
 supplies it — literally the tokens the next request re-caches if the cache is
-cold by then — and the context window's total input otherwise. The two agree to
-within a turn.
+cold by then — and the context window's total input on older builds. The two
+agree to within a turn. Right after a compaction the first is `null` and the
+second may still describe the old conversation, so no figure is shown until
+the next request.
 
 Once the cache is cold the figure stays, because it is then no longer a risk: it
 is what your next message costs extra.
@@ -290,10 +323,11 @@ is what your next message costs extra.
 dollar figure would imply a cost you will never see. Nothing in the status line
 input reveals which billing you are on, so the opt-in is the signal.
 
-The price table covers Fable 5.1 / 5, Mythos 5.1 / 5, Opus 5 / 4.8 / 4.7 /
-4.6 / 4.5, Sonnet 5 / 4.6 / 4.5 and Haiku 4.5 at list input rates. (Sonnet 5's
-$2 rate was announced as introductory; Anthropic made it the standard price in
-August 2026 and cancelled the September rise to $3.) An unrecognised model
+The price table covers Fable 5.1 / 5, Mythos 5.1 / 5, Opus 5.5 / 5 / 4.8 /
+4.7 / 4.6 / 4.5, Sonnet 5.5 / 5 / 4.6 / 4.5 and Haiku 4.5 at list input rates.
+(Sonnet 5's $2 rate was announced as introductory; Anthropic made it the
+standard price in August 2026 and cancelled the September rise to $3. Sonnet
+5.5 launched at the same $2.) An unrecognised model
 shows no figure rather than a guess. To price a model that is missing, or if
 your rates are not list rates — including rates an organisation has set through
 the `modelPricing` managed setting, which this script cannot see — give the
@@ -306,11 +340,11 @@ CLAUDE_CACHE_STATUS_PRICING=12.50
 
 Two billing modifiers are applied on top of the base price:
 
-- **Fast mode.** `/fast` bills Opus 5 and Opus 4.8 input at $10/Mtok, double
-  the standard rate, and the cache multipliers stack on it — so a fast-mode
+- **Fast mode.** `/fast` doubles the input rate — $8/Mtok on Opus 5.5, $10 on
+  Opus 5 and Opus 4.8 — and the cache multipliers stack on it, so a fast-mode
   session priced at the standard rate would show half the real figure. The
-  status line input carries a `fast_mode` flag, and the table doubles those two
-  models when it is set. A hand-supplied number is taken as given. One
+  status line input carries a `fast_mode` flag, and the table doubles those
+  three models when it is set. A hand-supplied number is taken as given. One
   imprecision: during a fast-mode rate-limit cooldown Claude Code runs at
   standard speed while the flag stays on, so the figure is briefly high — the
   safe direction.
@@ -394,7 +428,8 @@ short enough to audit in one sitting.
 
 From the transcript it extracts two timestamps, two integer token counts and the
 inference-geography flag of one response. No message content, no prompts, no
-tool output. The only string it can print is `cache <value>`.
+tool output. The only string it can print is `cache <value>`, optionally
+followed by a token count or a dollar figure.
 
 Properties worth stating explicitly:
 
@@ -432,20 +467,27 @@ Properties worth stating explicitly:
   transcript only when pricing is on. On older builds it is unavoidable: the
   1h/5m split appeared nowhere else, and if a release renames those fields the
   segment vanishes silently and needs a fix.
-- **Turning fast mode on mid-conversation is an invisible miss.** The first
-  request with fast mode on adds a header that is part of the cache key, so it
-  re-reads the whole conversation uncached, at fast-mode rates. The countdown
-  still shows the old prefix as warm until that request lands. Turning fast mode
-  off, the cooldown fallback to standard speed, and turning it back on later all
-  keep the cache.
+- **Some of your own actions are invisible misses.** The countdown times the
+  cached prefix; it cannot know that your next request will not match it.
+  Switching models with `/model`, changing effort on most models (Opus 5.5,
+  Sonnet 5.5 and Fable 5.1 keep the cache on the Claude API), connecting an
+  MCP server when tool search is off, and turning fast mode on all make the
+  next request re-read the whole conversation uncached while the segment still
+  shows it warm. Fast mode's header is fixed when a turn starts, so turning it
+  on mid-turn costs on the first request of your *next* turn, at fast-mode
+  rates; turning it off, the cooldown fallback and turning it back on later all
+  keep the cache. The VS Code extension's clock has the same blind spot. See
+  [actions that invalidate the
+  cache](https://code.claude.com/docs/en/prompt-caching#actions-that-invalidate-the-cache).
 - **With prompt caching disabled** (`DISABLE_PROMPT_CACHING` and its per-model
   variants), no cache write ever appears and the segment reads `cache ?`
   indefinitely — which is accurate, if unhelpful: there is no cache to time.
 - **A conversation can hold up to four cache breakpoints**, each with its own
   lifetime. This reports one number, tracking the prefix every request reads.
-- **`/compact` destroys the prefix.** For the window between compaction and your
-  next request, the countdown still refers to a prefix that no longer exists. It
-  corrects itself on the following turn.
+- **On older builds, `/compact` is not seen.** Compaction destroys the prefix.
+  On the `prompt_cache` path this reads as `cache cold` until your next request;
+  on the transcript path the countdown still refers to the old prefix for that
+  window, and corrects itself on the following turn.
 - **On older builds, a fork refreshes the cache invisibly.** A `fork` subagent
   inherits this conversation's exact prefix, so its first request reads — and
   therefore refreshes — this conversation's cache. Its transcript is a separate
@@ -471,23 +513,28 @@ SH=dash sh tests/claude-cache-status.test.sh  # script under a named shell
 `SH` selects the shell the *script* is executed with, which is what the
 portability claim is about. It is independent of the shell running the harness.
 
-103 checks: the `prompt_cache` path on both tiers with no transcript present,
+119 checks: the `prompt_cache` path on both tiers with no transcript present,
 expiry, clamping, precedence over a disagreeing transcript, no state file
-written, and five malformed shapes (unknown `ttl`, null or string `expires_at`,
-a non-object, absence) each falling back to the transcript; tier detection on
+written, five malformed shapes (unknown `ttl`, null or string `expires_at`,
+a non-object, absence) each falling back to the transcript, and the two
+not-warm states — just compacted, and a response with no cache tokens — read
+as cold over a transcript that says otherwise; the cold-state token count at
+each rounding boundary, and withheld while warm or under 1k; tier detection on
 both tiers and on a mixed write, every display granularity boundary, all six
 colour bands, tier memory across a write-free window, subagent exclusion,
 `NO_COLOR`, corrupt state files and a pre-1.2.0 three-field state file still
 honoured, path traversal via `session_id`, control-character stripping, nine
 malformed or hostile inputs verified to omit the segment without hanging, and
 every pricing path — each model in the table hand-checked against the
-arithmetic, the 0.025x read rate on Fable 5.1 and Mythos 5.1 alone, fast mode on
-the two models that have it and on those that do not, US-only inference stacked
-with each price source, remembered across a write-free window and still applied
+arithmetic, the 0.025x read rate on Fable 5.1 and Mythos 5.1 and the 0.05x on
+Opus 5.5 alone, Opus 5.5 kept out of the Opus 5 entry its id also matches,
+fast mode on the three models that have it and on those that do not, US-only
+inference stacked with each price source, remembered across a write-free window and still applied
 when the tier came from stdin, `recache_tokens_if_cold` preferred over the
-context total, unknown models and garbage prices producing no figure, and a
-1M-token context confirming the integer maths cannot overflow. Fixtures are generated at run time because every meaningful case is
-relative to the current time.
+context total and its `null` withholding the figure, unknown models and garbage
+prices producing no figure, and a 1M-token context confirming the integer maths
+cannot overflow. Fixtures are generated at run time because every meaningful
+case is relative to the current time.
 
 CI runs the suite on every push across six combinations: `sh`, `dash` and `bash`
 on Linux, and `sh`, `bash` and `zsh` on macOS. That spread is deliberate — it
@@ -496,11 +543,23 @@ ships on macOS, which is where portability bugs in a script like this surface.
 
 ## Prior art
 
-Claude Code itself, from v2.1.251, shows a `Prompt cache (main)` line in
-`/usage` — request count, hit ratio, misses with a likely cause, and whether
-the cache is warm right now with its TTL — and exposes the same ledger to
-status lines as `prompt_cache`. This script is built on that where it exists,
-and adds the countdown, the colour bands and the cost figure on top.
+Claude Code itself now covers part of this, in three places:
+
+- **`/usage`** (v2.1.251+) has a `Prompt cache (main)` line — request count,
+  hit ratio, misses with a likely cause, and whether the cache is warm right
+  now with its TTL — and the same ledger reaches status lines as
+  `prompt_cache`. This script is built on that where it exists.
+- **The idle-return nudge** in the terminal (v2.1.84+) suggests `/clear to save
+  N tokens` when you come back after 75 minutes or more, with N the current
+  context size; Pro plans also get a footer hint once the cache has expired
+  (v2.1.92+). Both arrive when you return, not before you leave, and the
+  75-minute timer is unrelated to either TTL. `cache cold 412k` is the same
+  number, shown from the moment it applies.
+- **The VS Code extension** has a prompt cache clock beside its context
+  indicator that counts down from the detected 5-minute or 1-hour lifetime and
+  turns red when it runs out or right after a compaction. If you work in VS
+  Code, you may not need this. In the terminal there is no equivalent, and the
+  clock has no cost figure, colour bands or seconds readout.
 
 Several other projects address this, with different tradeoffs. Worth reading
 before choosing:
