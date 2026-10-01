@@ -398,6 +398,26 @@ fixture "$W/pcg.jsonl" 30 0 5000 us
 check   "stdin tier + transcript geography"    "cache 59m \$7.31"  "$(pcp 1h 3570 claude-opus-5 700000 0 "$W/pcg.jsonl" pcg)"
 
 echo
+echo "-- recent miss cause (Claude Code >= 2.1.260) ---------------------------"
+# Shown for ten minutes after last_miss_at, first cause only, unknown causes
+# passed through with underscores as spaces, anything hostile stripped.
+pcm() {  # pcm <secs-since-miss> <last_miss_cause JSON> [env-assignment]
+  jq -nc --argjson e "$(( $(date +%s) + 3570 ))" --argjson m "$(( $(date +%s) - $1 ))" --argjson c "$2" \
+    '{transcript_path:"/nope/none.jsonl",session_id:"pcm",
+      prompt_cache:{ttl:"1h",expires_at:$e,caching_observed:true,warm:true,last_miss_at:$m,last_miss_cause:$c}}' \
+    | env ${3:-CLAUDE_CACHE_STATUS_MISS=1} "$SH" "$SCRIPT" 2>&1 | strip
+}
+check "miss 2m ago, tools changed"       "cache 59m (miss: tools changed)"    "$(pcm 120 '{"causes":["tools_changed"],"tools_added":2}')"
+check "miss, idle past 5m"               "cache 59m (miss: idle past 5m)"     "$(pcm 120 '{"causes":["ttl_expired_5m"]}')"
+check "miss, two causes -> first"        "cache 59m (miss: system prompt changed)" "$(pcm 120 '{"causes":["system_prompt_changed","tools_changed"]}')"
+check "miss, unknown cause passed through" "cache 59m (miss: thinking mode changed)" "$(pcm 120 '{"causes":["thinking_mode_changed"]}')"
+check "miss, hostile cause stripped"     "cache 59m (miss: rm31mx)"               "$(pcm 120 '{"causes":["X$(rm)\u001b[31m x"]}')"
+check "miss 11m ago -> not shown"        "cache 59m"                          "$(pcm 660 '{"causes":["tools_changed"]}')"
+check "miss cause null -> not shown"     "cache 59m"                          "$(pcm 120 'null')"
+check "miss cause empty -> not shown"    "cache 59m"                          "$(pcm 120 '{"causes":[]}')"
+check "CLAUDE_CACHE_STATUS_MISS=0 -> off" "cache 59m"                         "$(pcm 120 '{"causes":["tools_changed"]}' CLAUDE_CACHE_STATUS_MISS=0)"
+
+echo
 echo "-- Opus 5.5 and Sonnet 5.5 -------------------------------------------"
 # Opus 5.5 is $4/Mtok, not Opus 5's $5, and reads at 0.05x ($0.20): the loss is
 # (2 - 0.05) = 1.95x on 1h, (1.25 - 0.05) = 1.20x on 5m, $7.80 and $4.80 per
