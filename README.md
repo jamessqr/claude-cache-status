@@ -157,6 +157,7 @@ rather than before.
 | `cache 6:30` (red) | Under 15% remaining |
 | `cache 42s` (red) | Final minute |
 | `cache cold 412k` (red) | Expired — your next turn re-pays the write on 412k tokens |
+| `cache 47m (miss: tools changed)` | A cache miss in the last 10 minutes, and its likely cause |
 | `cache ?` (grey) | Session is live but no cache write has been seen, so the tier is unknown — or caching is off or unreported |
 | *(nothing)* | Not a Claude Code session, or no transcript available |
 
@@ -169,6 +170,27 @@ probably already shows — and not under 1k.
 
 With pricing enabled (below), every countdown and `cache cold` carry a dollar
 figure instead: `cache 47m $6.65`.
+
+### Recent misses
+
+A **miss** is a turn that paid to rebuild cache it should have read for
+cheap. The cache was still warm, but something about the request changed, so
+the API couldn't reuse it and rewrote it at the write price. That is the same
+cost as letting it expire, except it happened while you were still working.
+
+Since v2.1.260 Claude Code works out the likely cause, and for ten minutes
+after a miss the segment shows it in amber: `cache 47m (miss: tools changed)`.
+
+| Shown | Usually means |
+|---|---|
+| `tools changed` | An MCP server connected or a plugin or tool was added or removed |
+| `system prompt changed` | The system prompt itself changed, for example a different `--append-system-prompt` on resume |
+| `idle past 5m` / `idle past 1h` | You were away longer than the cache lifetime. Repeated `idle past 5m` is a sign `promptCacheTtl: "1h"` would pay for itself |
+| `server side` | Probably nothing you did: the request matched, but the API had no entry to read |
+
+Other causes are shown under their own names, underscores turned to spaces.
+Compactions and tool-result clearing are expected rebuilds, not misses, and
+never appear. `CLAUDE_CACHE_STATUS_MISS=0` turns this off.
 
 Two deliberate choices there.
 
@@ -381,11 +403,13 @@ transcript:
 
 ## Configuration
 
-There is no config file. Three environment knobs:
+There is no config file. Four environment knobs:
 
 - **`CLAUDE_CACHE_STATUS_PRICING`** — unset (default) shows no dollar figure.
   `api` uses the built-in price table; a number is treated as dollars per
   million input tokens. See [Cost at risk](#cost-at-risk-opt-in).
+- **`CLAUDE_CACHE_STATUS_MISS`** — `0` hides the [recent-miss
+  cause](#recent-misses). Shown by default.
 - **`NO_COLOR`** — any non-empty value disables all styling
   ([no-color.org](https://no-color.org)).
 - **`XDG_CACHE_HOME`** — where the state file lives (default `~/.cache`).
@@ -429,7 +453,9 @@ short enough to audit in one sitting.
 From the transcript it extracts two timestamps, two integer token counts and the
 inference-geography flag of one response. No message content, no prompts, no
 tool output. The only string it can print is `cache <value>`, optionally
-followed by a token count or a dollar figure.
+followed by a token count or a dollar figure and a `(miss: <cause>)` note. The
+cause name comes from Claude Code and is reduced to `[a-z0-9_]` before it is
+printed.
 
 Properties worth stating explicitly:
 
@@ -513,13 +539,15 @@ SH=dash sh tests/claude-cache-status.test.sh  # script under a named shell
 `SH` selects the shell the *script* is executed with, which is what the
 portability claim is about. It is independent of the shell running the harness.
 
-119 checks: the `prompt_cache` path on both tiers with no transcript present,
+128 checks: the `prompt_cache` path on both tiers with no transcript present,
 expiry, clamping, precedence over a disagreeing transcript, no state file
 written, five malformed shapes (unknown `ttl`, null or string `expires_at`,
 a non-object, absence) each falling back to the transcript, and the two
 not-warm states — just compacted, and a response with no cache tokens — read
 as cold over a transcript that says otherwise; the cold-state token count at
-each rounding boundary, and withheld while warm or under 1k; tier detection on
+each rounding boundary, and withheld while warm or under 1k; the recent-miss
+note's labels, its ten-minute window, first-cause-only, an unknown cause
+passed through, a hostile one stripped, and the off switch; tier detection on
 both tiers and on a mixed write, every display granularity boundary, all six
 colour bands, tier memory across a write-free window, subagent exclusion,
 `NO_COLOR`, corrupt state files and a pre-1.2.0 three-field state file still
@@ -559,7 +587,7 @@ Claude Code itself now covers part of this, in three places:
   indicator that counts down from the detected 5-minute or 1-hour lifetime and
   turns red when it runs out or right after a compaction. If you work in VS
   Code, you may not need this. In the terminal there is no equivalent, and the
-  clock has no cost figure, colour bands or seconds readout.
+  clock has no cost figure, colour bands, seconds readout or miss cause.
 
 Several other projects address this, with different tradeoffs. Worth reading
 before choosing:

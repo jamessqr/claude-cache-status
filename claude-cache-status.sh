@@ -47,7 +47,8 @@
 #            can print are "cache <value>", "cache cold" and "cache ?", the
 #            first two optionally followed by a dollar figure when
 #            CLAUDE_CACHE_STATUS_PRICING is set, and "cache cold" otherwise
-#            by a token count such as "412k".
+#            by a token count such as "412k". Either may end with
+#            "(miss: <cause>)" for ten minutes after a cache miss.
 #
 # INSTALL
 #   "statusLine": { "type": "command",
@@ -194,6 +195,21 @@ _read_permille() {
   esac
 }
 
+# Short label for a prompt_cache.last_miss_cause name, as Claude Code reports
+# it. The names are open-ended (new causes have been added since v2.1.260), so
+# an unknown one is shown as itself with underscores as spaces rather than
+# dropped: by the time it reaches here it is [a-z0-9_] and at most 32 long.
+_miss_label() {
+  case "$1" in
+    tools_changed) echo "tools changed" ;;
+    system_prompt_changed) echo "system prompt changed" ;;
+    ttl_expired_5m) echo "idle past 5m" ;;
+    ttl_expired_1h) echo "idle past 1h" ;;
+    likely_server_side) echo "server side" ;;
+    *) printf '%s\n' "$1" | tr '_' ' ' ;;
+  esac
+}
+
 # Validate the inference-geography multiplier read back from the state file.
 # Exactly two values exist: 100 (global routing, standard pricing) and 110
 # (US-only inference, which the API bills at 1.1x on every token category,
@@ -207,7 +223,8 @@ _is_geo() {
 
 # ---------------------------------------------------------------------------
 # COMPUTE  (needs $input; sets $cache_ttl, $cache_left, $cache_state,
-#           $cache_tokens, and $cache_cents when pricing is opted in)
+#           $cache_tokens, $cache_miss, and $cache_cents when pricing is
+#           opted in)
 # ---------------------------------------------------------------------------
 #
 # One jq pass. printf '%s' rather than echo: echo mangles backslash escapes in
@@ -242,7 +259,12 @@ ccs_fields=$(printf '%s' "$input" | jq -r '
          | if type == "number" then floor | tostring
            elif ($pc | has("recache_tokens_if_cold")) then "null"
            else "" end),
-      ($pc.warm | if type == "boolean" then tostring else "" end)
+      ($pc.warm | if type == "boolean" then tostring else "" end),
+      ($pc.last_miss_at | if type == "number" then floor | tostring else "" end),
+      ($pc.last_miss_cause
+         | if type == "object" then (.causes | if type == "array" then (.[0] // "") else "" end)
+           else "" end
+         | tostring | gsub("[^a-z0-9_]"; "") | .[0:32])
   ' 2>/dev/null)
 {
   IFS= read -r ccs_session
@@ -255,6 +277,8 @@ ccs_fields=$(printf '%s' "$input" | jq -r '
   IFS= read -r ccs_pc_observed
   IFS= read -r ccs_pc_tokens
   IFS= read -r ccs_pc_warm
+  IFS= read -r ccs_pc_miss_at
+  IFS= read -r ccs_pc_miss_cause
 } <<EOF
 $ccs_fields
 EOF
@@ -270,6 +294,7 @@ cache_left=""
 cache_state=""   # "" = nothing to show, "unknown" = session known, tier not
 cache_cents=""   # cost at risk in whole cents, only when pricing is opted in
 cache_tokens=""  # tokens the next request re-caches if the prefix is cold
+cache_miss=""    # likely cause of a recent cache miss, as a short label
 
 ccs_now=$(date +%s)
 ccs_tier=""      # TTL in seconds: 300 or 3600
@@ -544,13 +569,29 @@ elif _is_int "$ccs_anchor"; then
   # been seen, so the tier is unknown. Distinct from "not a Claude session".
   cache_state="unknown"
 fi
+
+# ---- recent miss (Claude Code >= 2.1.260) ---------------------------------
+# A miss is a request that re-processed what the cache already held: Claude
+# Code paid the write price again for a prefix it should have read. When it
+# can tell why, it names the cause, and the segment shows that for ten
+# minutes after the miss — long enough to be seen on return to the terminal,
+# short enough not to linger into unrelated work. Compactions and tool-result
+# clearing are expected rebuilds, not misses, and never appear here.
+# CLAUDE_CACHE_STATUS_MISS=0 turns it off.
+if [ "${CLAUDE_CACHE_STATUS_MISS:-1}" != 0 ] && [ -n "$ccs_pc_miss_cause" ] &&
+   _is_int "$ccs_pc_miss_at" && _is_int "$ccs_now"; then
+  ccs_miss_age=$(( ccs_now - ccs_pc_miss_at ))
+  if [ "$ccs_miss_age" -ge -60 ] && [ "$ccs_miss_age" -lt 600 ]; then
+    cache_miss=$(_miss_label "$ccs_pc_miss_cause")
+  fi
+fi
 # ---- end COMPUTE ----------------------------------------------------------
 
 line=""
 
 # ---------------------------------------------------------------------------
 # RENDER  (needs $cache_ttl, $cache_left, $cache_state, $cache_tokens,
-#          $cache_cents, the C_* colours)
+#          $cache_cents, $cache_miss, the C_* colours)
 # ---------------------------------------------------------------------------
 if [ "$cache_state" = "unknown" ]; then
   # An anchor exists but no cache write has been seen, so the tier is unknown
@@ -617,6 +658,12 @@ elif [ -n "$cache_left" ] && [ -n "$cache_ttl" ]; then
   fi
 
   line="${cache_color}${cache_text}${C_RESET}"
+
+  # A recent miss, in amber whatever the countdown's colour: it is a past
+  # event to explain, not part of the current urgency.
+  if [ -n "$cache_miss" ]; then
+    line="$line ${C_WARN}(miss: ${cache_miss})${C_RESET}"
+  fi
 fi
 # ---- end RENDER ----------------------------------------------------------
 
