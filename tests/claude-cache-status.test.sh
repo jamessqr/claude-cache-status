@@ -343,12 +343,44 @@ check "prompt_cache absent (older build)"     "cache 59m" "$(run "$W/pcf.jsonl" 
 # caching_observed:false is Claude Code saying no response has carried cache
 # tokens. Nothing to count down; say so rather than staying silent.
 check "caching_observed false -> unknown"     "cache ?"   "$(pc_raw /nope/none.jsonl pcf6 '{"caching_observed":false,"warm":false,"expires_at":null}')"
+# Two states where Claude Code knows the prefix is not warm, though the
+# transcript (a 1h write 30 seconds old) would say it is.
+check "warm false, expires null -> cold"      "cache cold" "$(pc_raw "$W/pcf.jsonl" pcf7 '{"ttl":"1h","warm":false,"expires_at":null,"caching_observed":true}')"
+check "recache null after compaction -> cold" "cache cold" "$(pc_raw "$W/pcf.jsonl" pcf8 '{"ttl":"1h","warm":true,"expires_at":'"$_soon"',"caching_observed":true,"recache_tokens_if_cold":null}')"
+# ...but warm:false with a live expiry is left to the expiry, and an absent
+# recache field (as opposed to null) is not a compaction.
+# (_soon is about 100 seconds out; only the shape of the value is asserted.)
+contains "warm false, expires live -> expiry" "cache 1:" "$(pc_raw /nope/none.jsonl pcf9 '{"ttl":"1h","warm":false,"expires_at":'"$_soon"',"caching_observed":true}')"
+contains "recache absent -> countdown"        "cache 1:" "$(pc_raw /nope/none.jsonl pcfa '{"ttl":"1h","expires_at":'"$_soon"',"caching_observed":true}')"
+
+echo
+echo "-- cold shows the re-write size when unpriced --------------------------"
+# The same number as Claude Code's "/clear to save N tokens" nudge: what the
+# next message re-sends uncached. Only when cold, only when unpriced (pricing
+# shows dollars instead), and not under 1k.
+pct() {  # pct <secs-until-expiry> <recache-tokens JSON> -> stripped output, unpriced
+  jq -nc --argjson e "$(( $(date +%s) + $1 ))" --argjson rc "$2" \
+    '{transcript_path:"/nope/none.jsonl",session_id:"pct",
+      prompt_cache:{ttl:"1h",expires_at:$e,caching_observed:true,warm:false,recache_tokens_if_cold:$rc}}' \
+    | "$SH" "$SCRIPT" 2>&1 | strip
+}
+check "cold, 412,345 tokens -> 412k"          "cache cold 412k"  "$(pct -120 412345)"
+check "cold, 1,250,000 tokens -> 1.3M"        "cache cold 1.3M"  "$(pct -120 1250000)"
+check "cold, 999,600 tokens -> 1.0M not 1000k" "cache cold 1.0M" "$(pct -120 999600)"
+check "cold, 800 tokens -> no count"          "cache cold"       "$(pct -120 800)"
+check "warm -> no count"                      "cache 59m"        "$(pct 3570 412345)"
+# The transcript path (builds before 2.1.251) uses the context total.
+_o=$(jq -nc --arg t "$W/g5.jsonl" '{transcript_path:$t,session_id:"pct2",context_window:{total_input_tokens:700000}}' \
+  | "$SH" "$SCRIPT" 2>&1 | strip)
+check "transcript path, cold -> context total" "cache cold 700k" "$_o"
 
 echo
 echo "-- pricing on the stdin path -------------------------------------------"
 # recache_tokens_if_cold is the purpose-built count ("tokens the next request
-# re-caches if the cache has gone cold") and is preferred; the context
-# window's total input is the fallback when it is null (right after /compact).
+# re-caches if the cache has gone cold") and is preferred over the context
+# window's total input. When it is present but null, Claude Code has just
+# compacted: the cache does not cover the new conversation, so it is cold, and
+# no figure is shown because neither count describes the new size yet.
 pcp() {  # pcp <ttl> <secs> <model> <recache-tokens JSON> <total-input> [transcript] [session]
   jq -nc --arg t "${6:-/nope/none.jsonl}" --arg s "${7:-pcp}" --arg ttl "$1" \
     --argjson e "$(( $(date +%s) + $2 ))" --arg m "$3" --argjson rc "$4" --argjson n "$5" \
@@ -357,13 +389,28 @@ pcp() {  # pcp <ttl> <secs> <model> <recache-tokens JSON> <total-input> [transcr
     | CLAUDE_CACHE_STATUS_PRICING=api "$SH" "$SCRIPT" 2>&1 | strip
 }
 check   "recache tokens preferred over total"  "cache 59m \$6.65"  "$(pcp 1h 3570 claude-opus-5 700000 100)"
-check   "recache null -> total input tokens"   "cache 59m \$6.65"  "$(pcp 1h 3570 claude-opus-5 null 700000)"
+check   "recache null (compacted) -> cold, no \$" "cache cold"       "$(pcp 1h 3570 claude-opus-5 null 700000)"
 check_t "stdin 5m tier prices at 1.15x"        "cache 4:30 \$4.02" "cache 4:29 \$4.02" "$(pcp 5m 270 claude-opus-5 700000 0)"
 # US-only inference is recorded only in the transcript, so pricing still
 # consults it when stdin has settled the tier. The transcript here says 5m;
 # the tier and anchor nonetheless come from stdin, only the 1.1x is taken.
 fixture "$W/pcg.jsonl" 30 0 5000 us
 check   "stdin tier + transcript geography"    "cache 59m \$7.31"  "$(pcp 1h 3570 claude-opus-5 700000 0 "$W/pcg.jsonl" pcg)"
+
+echo
+echo "-- Opus 5.5 and Sonnet 5.5 -------------------------------------------"
+# Opus 5.5 is $4/Mtok, not Opus 5's $5, and reads at 0.05x ($0.20): the loss is
+# (2 - 0.05) = 1.95x on 1h, (1.25 - 0.05) = 1.20x on 5m, $7.80 and $4.80 per
+# Mtok. It has fast mode at $8. Its id contains "opus-5", so a glob that
+# reached the Opus 5 entry first would price it at $9.50.
+check "1h Opus 5.5   700K -> 0.7 x \$7.80"   "cache 59m \$5.46"  "$(priced "$W/p1h.jsonl" o1 claude-opus-5-5   700000)"
+fixture "$W/o5m.jsonl" 30 0 5000
+check_t "5m Opus 5.5 700K -> 0.7 x \$4.80"   "cache 4:30 \$3.36" "cache 4:29 \$3.36" "$(priced "$W/o5m.jsonl" o2 claude-opus-5-5 700000)"
+check "1h Opus 5.5 fast  -> 0.7 x \$15.60"   "cache 59m \$10.92" "$(priced "$W/p1h.jsonl" o3 claude-opus-5-5   700000 api true)"
+check "explicit 4 + Opus 5.5 -> 0.05x read"  "cache 59m \$5.46"  "$(priced "$W/p1h.jsonl" o4 claude-opus-5-5   700000 4)"
+# Sonnet 5.5 shares Sonnet 5's $2 and the standard 0.1x read.
+check "1h Sonnet 5.5 700K -> 0.7 x \$3.80"   "cache 59m \$2.66"  "$(priced "$W/p1h.jsonl" o5 claude-sonnet-5-5 700000)"
+check "fast flag on Sonnet 5.5 -> standard"  "cache 59m \$2.66"  "$(priced "$W/p1h.jsonl" o6 claude-sonnet-5-5 700000 api true)"
 
 echo
 echo "-- Fable 5.1 / Mythos 5.1 bill cache reads at 0.025x -------------------"
